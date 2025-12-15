@@ -403,7 +403,9 @@ class DynamixelDriver(DynamixelDriverProtocol):
                     self._portHandler, dxl_id, ADDR_TORQUE_ENABLE, torque_value
                 )
                 if dxl_comm_result != COMM_SUCCESS or dxl_error != 0:
+                    print("Error")
                     print(dxl_comm_result)
+                    print(COMM_SUCCESS)
                     print(dxl_error)
                     raise RuntimeError(
                         f"Failed to set torque mode for Dynamixel with ID {dxl_id}"

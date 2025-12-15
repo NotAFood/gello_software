@@ -43,12 +43,15 @@ class Args:
     channel: str = "can_left"
     """CAN channel for YAM robot communication."""
 
+    first_joint_id: int = 1
+    """The first joint ID to start from. Default is 1."""
+
     def __post_init__(self):
         assert len(self.joint_signs) == len(self.start_joints)
         for idx, j in enumerate(self.joint_signs):
-            assert (
-                j == -1 or j == 1
-            ), f"Joint idx: {idx} should be -1 or 1, but got {j}."
+            assert j == -1 or j == 1, (
+                f"Joint idx: {idx} should be -1 or 1, but got {j}."
+            )
 
     @property
     def num_robot_joints(self) -> int:
@@ -71,7 +74,7 @@ def find_gello_port() -> Optional[str]:
     else:
         print("Multiple FTDI ports found:")
         for i, port in enumerate(possible_ports):
-            print(f"  {i+1}: {port}")
+            print(f"  {i + 1}: {port}")
 
         while True:
             try:
@@ -88,7 +91,7 @@ def get_joint_offsets(
     args: Args, port: str
 ) -> Tuple[list, Optional[Tuple[float, float]]]:
     """Get joint offsets using the same logic as gello_get_offset.py."""
-    joint_ids = list(range(1, args.num_joints + 1))
+    joint_ids = list(range(args.first_joint_id, args.first_joint_id + args.num_joints))
     driver = DynamixelDriver(joint_ids, port=port, baudrate=57600)
 
     def get_error(offset: float, index: int, joint_state: np.ndarray) -> float:
@@ -149,7 +152,9 @@ def update_config_with_offsets(
                     (
                         int(x)
                         if isinstance(x, (int, float, np.number)) and x == int(x)
-                        else float(x) if isinstance(x, (int, float, np.number)) else x
+                        else float(x)
+                        if isinstance(x, (int, float, np.number))
+                        else x
                     )
                     for x in data
                 ]
