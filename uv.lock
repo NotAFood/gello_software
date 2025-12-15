@@ -404,6 +404,21 @@ wheels = [
 ]
 
 [[package]]
+name = "depthai"
+version = "3.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/df/bb/e01bf631b71463446bb00d7dc8c757abf6d33e65997bf867fd9f83634995/depthai-3.2.1-cp39.cp310.cp311.cp312.cp313.cp314-cp39.cp310.cp311.cp312.cp313.cp314-macosx_11_0_arm64.whl", hash = "sha256:2c104446c1c4448894b892e46a42068e9631a75fcd3257177e66094da154e1cc", size = 58283289, upload-time = "2025-11-28T17:17:04.543Z" },
+    { url = "https://files.pythonhosted.org/packages/b1/3d/44ce46afe7eb62f3ce7060236ac909760dd4f58b9062e062295061622de7/depthai-3.2.1-cp39.cp310.cp311.cp312.cp313.cp314-cp39.cp310.cp311.cp312.cp313.cp314-macosx_11_0_x86_64.whl", hash = "sha256:6341c6846e7f469e4175e14a08e43066d8c389356c62fc21bc884f963cb38c5c", size = 61795416, upload-time = "2025-11-28T17:17:10.149Z" },
+    { url = "https://files.pythonhosted.org/packages/70/4c/e958f15340076e5130496245c2376a725eabfce9e119af6f978ab779ba96/depthai-3.2.1-cp39.cp310.cp311.cp312.cp313.cp314-cp39.cp310.cp311.cp312.cp313.cp314-manylinux_2_28_aarch64.whl", hash = "sha256:f6643b4a863e267cacf25cbb63b6f7f165d6f9f02ed2885e1b3e84989dc62bca", size = 85356818, upload-time = "2025-11-28T17:17:15.746Z" },
+    { url = "https://files.pythonhosted.org/packages/71/86/036b426954f105ae91e9029334c8475ce9514b31f5bd6692a68574b69c41/depthai-3.2.1-cp39.cp310.cp311.cp312.cp313.cp314-cp39.cp310.cp311.cp312.cp313.cp314-manylinux_2_28_x86_64.whl", hash = "sha256:42721c4c2dd1194d72bc6cf1d9f95b305245c96e491f8dbcfa7e228d45e6c48a", size = 90726841, upload-time = "2025-11-28T17:17:21.541Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/0b/21bf62a90d768d8a3f499f4264fb1947c5f12d106926199a4b36e84c6771/depthai-3.2.1-cp39.cp310.cp311.cp312.cp313.cp314-cp39.cp310.cp311.cp312.cp313.cp314-win_amd64.whl", hash = "sha256:5ff6f0082403979bab15cc38d3fa85b77308312af8aaa62140bbc19e17b47f70", size = 81728934, upload-time = "2025-11-28T17:17:27.305Z" },
+]
+
+[[package]]
 name = "dm-control"
 version = "1.0.34"
 source = { registry = "https://pypi.org/simple" }
@@ -545,6 +560,7 @@ name = "gello-software"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "depthai" },
     { name = "dm-control" },
     { name = "numpy-quaternion" },
     { name = "omegaconf" },
@@ -569,6 +585,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "depthai", specifier = ">=3.2.1" },
     { name = "dm-control", specifier = ">=1.0.34" },
     { name = "numpy-quaternion", specifier = ">=2024.0.13" },
     { name = "omegaconf", specifier = "==2.3.0" },

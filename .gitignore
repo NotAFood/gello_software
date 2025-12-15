@@ -38,3 +38,5 @@ third_party/i2rt/
 
 # 3D Model Files
 *.stl
+
+data/
