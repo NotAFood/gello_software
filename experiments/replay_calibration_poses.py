@@ -3,14 +3,12 @@
 Replay calibration poses for camera calibration data collection.
 
 Usage:
-    # Basic usage (camera mxid read from config):
+    # Basic usage (config inferred from poses file):
     uv run experiments/replay_calibration_poses.py \
-        --config-path configs/yam_left.yaml \
         --poses-path data/calibration_poses/calibration_poses_left_2025-12-15_12-34-56.json
 
     # With custom output directory:
     uv run experiments/replay_calibration_poses.py \
-        --config-path configs/yam_left.yaml \
         --poses-path data/calibration_poses/calibration_poses_left_2025-12-15_12-34-56.json \
         --output-dir data/my_calibration_session
 
@@ -31,7 +29,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import numpy as np
 import tyro
@@ -210,16 +208,40 @@ def capture_camera_image(
     return success
 
 
-def infer_arm_name_from_channel(channel: str) -> str:
-    """Infer arm name (left/right) from a CAN channel string."""
-    channel_lower = channel.lower()
+def normalize_arm_identifier(raw_arm_name: str) -> tuple[str, str]:
+    """Return the arm identifier and a filename-safe slug."""
+    identifier = str(raw_arm_name)
+    slug = identifier.replace("\\", "/").replace("/", "__").replace(" ", "_")
+    return identifier, slug
 
-    if any(tag in channel_lower for tag in ["left", "_l", "-l", " l", "l_"]):
-        return "left"
-    if any(tag in channel_lower for tag in ["right", "_r", "-r", " r", "r_"]):
-        return "right"
 
-    return "arm"
+def write_session_metadata(
+    output_dir: Path,
+    config_path: Path,
+    poses_path: Path,
+    arm_identifier: str,
+    pose_numbers_replayed: list[int],
+    start_pose_index: int,
+    total_poses: int,
+):
+    """Persist metadata for downstream consumers of a calibration session."""
+
+    metadata = {
+        "config_path": str(config_path),
+        "poses_path": str(poses_path),
+        "arm_identifier": arm_identifier,
+        "start_pose_index": start_pose_index,
+        "total_poses_in_file": total_poses,
+        "pose_numbers_replayed": pose_numbers_replayed,
+        "saved_at": datetime.now().isoformat(),
+    }
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = output_dir / "session_metadata.json"
+    with open(metadata_path, "w") as f:
+        json.dump(metadata, f, indent=2)
+
+    print(f"Metadata written to {metadata_path}")
 
 
 def ring_bell():
@@ -229,9 +251,6 @@ def ring_bell():
 
 @dataclass
 class Args:
-    config_path: str
-    """Path to the arm configuration YAML file."""
-
     poses_path: str
     """Path to the calibration poses JSON file."""
 
@@ -260,6 +279,16 @@ def load_calibration_poses(poses_path: Path) -> dict:
     return data
 
 
+def resolve_config_path(config_identifier: str) -> Path:
+    """Resolve config identifier (relative or absolute) to an absolute path."""
+    candidate = Path(config_identifier).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+
+    repo_root = Path(__file__).resolve().parent.parent
+    return (repo_root / candidate).resolve()
+
+
 def main():
     # Register cleanup handlers
     atexit.register(cleanup)
@@ -269,26 +298,26 @@ def main():
     args = tyro.cli(Args)
 
     # Load calibration poses
-    poses_data = load_calibration_poses(Path(args.poses_path))
+    poses_path = Path(args.poses_path)
+    poses_data = load_calibration_poses(poses_path)
     poses = poses_data["poses"]
-    arm_name = poses_data.get("arm_name", "arm")  # Fallback for older pose files
+
+    arm_identifier_raw = poses_data["arm_name"]
+    config_path = resolve_config_path(arm_identifier_raw)
+    arm_identifier, arm_slug = normalize_arm_identifier(arm_identifier_raw)
 
     # Load robot config
-    cfg = OmegaConf.to_container(OmegaConf.load(args.config_path), resolve=True)
-
-    # If arm_name wasn't in pose file, infer from config channel
-    if arm_name == "arm" and isinstance(cfg, dict):
-        channel = cfg.get("robot", {}).get("channel")
-        if isinstance(channel, str):
-            arm_name = infer_arm_name_from_channel(channel)
+    cfg = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
 
     # Setup output directory
     if args.output_dir:
         output_dir = Path(args.output_dir)
     else:
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_dir = Path(f"data/calibration_images/{arm_name}_{timestamp}")
+        output_dir = Path(f"data/calibration_images/{arm_slug}_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    pose_numbers_replayed: list[int] = []
 
     # Initialize cameras from config
     cameras = {}
@@ -296,7 +325,7 @@ def main():
         mxid = cfg.get("mxid")
         if mxid:
             print("\nInitializing camera...")
-            cam_name = f"wrist_{arm_name}"
+            cam_name = f"wrist_{arm_slug}"
             try:
                 camera = OakColorCamera(
                     name=cam_name,
@@ -318,10 +347,10 @@ def main():
             print("\nNo camera mxid in config, skipping camera initialization.")
 
     print(f"\n{'=' * 70}")
-    print(f"Calibration Pose Replay - {arm_name.upper()}")
+    print(f"Calibration Pose Replay - {arm_identifier}")
     print(f"{'=' * 70}")
-    print(f"Config: {args.config_path}")
-    print(f"Poses file: {args.poses_path}")
+    print(f"Config: {config_path}")
+    print(f"Poses file: {poses_path}")
     print(f"Total poses: {len(poses)}")
     print(f"Starting from pose: {args.start_pose_index + 1}")
     print(f"Cameras: {len(cameras)}")
@@ -377,11 +406,11 @@ def main():
                     "This usually happens when another robot control script is running."
                 )
                 print("\nTry one of these solutions:")
-                print(f"  1. Kill the other process using: kill_nodes.sh")
+                print("  1. Kill the other process using: kill_nodes.sh")
                 print(
-                    f"  2. Use a different port by adding to your config: hardware_server_port: <port>"
+                    "  2. Use a different port by adding to your config: hardware_server_port: <port>"
                 )
-                print(f"  3. Wait a few seconds and try again")
+                print("  3. Wait a few seconds and try again")
                 cleanup()
                 import os
 
@@ -438,6 +467,8 @@ def main():
 
             pose_num = pose["pose_number"]
             target_joints = pose["joint_positions"]
+
+            pose_numbers_replayed.append(pose_num)
 
             print(f"\n[{i + 1}/{len(poses)}] Moving to Pose #{pose_num}...")
             print(f"  Timestamp: {pose['timestamp']}")
@@ -527,6 +558,19 @@ def main():
         except Exception as e:
             print(f"Could not return to home: {e}")
     finally:
+        try:
+            write_session_metadata(
+                output_dir=output_dir,
+                config_path=config_path,
+                poses_path=poses_path,
+                arm_identifier=arm_identifier,
+                pose_numbers_replayed=pose_numbers_replayed,
+                start_pose_index=args.start_pose_index,
+                total_poses=len(poses),
+            )
+        except Exception as e:
+            print(f"Failed to write session metadata: {e}")
+
         cleanup()
         import os
 
