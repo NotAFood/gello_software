@@ -3,36 +3,23 @@
 Replay calibration poses for camera calibration data collection.
 
 Usage:
-    # Without cameras (testing only):
+    # Basic usage (camera mxid read from config):
     uv run experiments/replay_calibration_poses.py \
-        --config-path configs/yam_auto_generated.yaml \
-        --poses-path data/calibration_poses/calibration_poses_arm_2025-12-14_23-57-55.json
-
-    # With single camera:
-    uv run experiments/replay_calibration_poses.py \
-        --config-path configs/yam_auto_generated.yaml \
-        --poses-path data/calibration_poses/calibration_poses_arm_2025-12-14_23-57-55.json \
-        --camera-mxids wrist:14442C10E1F94CD800
-
-    # With multiple cameras:
-    uv run experiments/replay_calibration_poses.py \
-        --config-path configs/yam_auto_generated.yaml \
-        --poses-path data/calibration_poses/calibration_poses_arm_2025-12-14_23-57-55.json \
-        --camera-mxids wrist_left:14442C10E1F94CD800 wrist_right:14442C10E1F94CDA00
+        --config-path configs/yam_left.yaml \
+        --poses-path data/calibration_poses/calibration_poses_left_2025-12-15_12-34-56.json
 
     # With custom output directory:
     uv run experiments/replay_calibration_poses.py \
-        --config-path configs/yam_auto_generated.yaml \
-        --poses-path data/calibration_poses/calibration_poses_arm_2025-12-14_23-57-55.json \
-        --camera-mxids wrist:14442C10E1F94CD800 \
+        --config-path configs/yam_left.yaml \
+        --poses-path data/calibration_poses/calibration_poses_left_2025-12-15_12-34-56.json \
         --output-dir data/my_calibration_session
 
 This script will:
 1. Load the saved calibration poses
-2. Initialize OAK cameras (if specified)
+2. Initialize OAK camera (if mxid specified in config)
 3. Move the robot to each pose with smooth transitions
 4. Wait briefly for settling
-5. Capture images from all cameras
+5. Capture images from the camera
 6. Ring terminal bell and print confirmation
 """
 
@@ -69,14 +56,14 @@ def cleanup():
     cleanup_in_progress = True
 
     print("\nCleaning up resources...")
-    
+
     # Stop cameras
     for camera in active_cameras:
         try:
             camera.stop()
         except Exception as e:
             print(f"Error stopping camera: {e}")
-    
+
     # Close servers
     for server in active_servers:
         try:
@@ -202,24 +189,37 @@ def capture_camera_image(
         try:
             # Read frame from camera
             rgb_image, img_timestamp = camera.read()
-            
+
             # Create filename: <camera_name>_pose_<num>_<timestamp>.png
             filename = f"{cam_name}_pose_{pose_number:03d}_{timestamp}.png"
             filepath = output_dir / filename
-            
+
             # Save image (using cv2 or PIL)
             import cv2
+
             # Convert RGB to BGR for cv2
             bgr_image = rgb_image[:, :, ::-1]
             cv2.imwrite(str(filepath), bgr_image)
-            
+
             print(f"    Saved: {filename}")
-            
+
         except Exception as e:
             print(f"    Error capturing from {cam_name}: {e}")
             success = False
-    
+
     return success
+
+
+def infer_arm_name_from_channel(channel: str) -> str:
+    """Infer arm name (left/right) from a CAN channel string."""
+    channel_lower = channel.lower()
+
+    if any(tag in channel_lower for tag in ["left", "_l", "-l", " l", "l_"]):
+        return "left"
+    if any(tag in channel_lower for tag in ["right", "_r", "-r", " r", "r_"]):
+        return "right"
+
+    return "arm"
 
 
 def ring_bell():
@@ -234,9 +234,6 @@ class Args:
 
     poses_path: str
     """Path to the calibration poses JSON file."""
-
-    camera_mxids: Optional[List[str]] = None
-    """List of camera MXIDs to use for capture. Format: name1:mxid1 name2:mxid2"""
 
     output_dir: Optional[str] = None
     """Directory to save captured images. Defaults to data/calibration_images/<timestamp>"""
@@ -274,7 +271,16 @@ def main():
     # Load calibration poses
     poses_data = load_calibration_poses(Path(args.poses_path))
     poses = poses_data["poses"]
-    arm_name = poses_data["arm_name"]
+    arm_name = poses_data.get("arm_name", "arm")  # Fallback for older pose files
+
+    # Load robot config
+    cfg = OmegaConf.to_container(OmegaConf.load(args.config_path), resolve=True)
+
+    # If arm_name wasn't in pose file, infer from config channel
+    if arm_name == "arm" and isinstance(cfg, dict):
+        channel = cfg.get("robot", {}).get("channel")
+        if isinstance(channel, str):
+            arm_name = infer_arm_name_from_channel(channel)
 
     # Setup output directory
     if args.output_dir:
@@ -284,18 +290,13 @@ def main():
         output_dir = Path(f"data/calibration_images/{arm_name}_{timestamp}")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize cameras
+    # Initialize cameras from config
     cameras = {}
-    if args.camera_mxids:
-        print("\nInitializing cameras...")
-        for cam_spec in args.camera_mxids:
-            if ":" in cam_spec:
-                cam_name, mxid = cam_spec.split(":", 1)
-            else:
-                # No name specified, use generic name
-                cam_name = f"camera_{len(cameras)}"
-                mxid = cam_spec
-            
+    if isinstance(cfg, dict):
+        mxid = cfg.get("mxid")
+        if mxid:
+            print("\nInitializing camera...")
+            cam_name = f"wrist_{arm_name}"
             try:
                 camera = OakColorCamera(
                     name=cam_name,
@@ -310,8 +311,11 @@ def main():
                 print(f"  ✗ Failed to initialize {cam_name} ({mxid}): {e}")
                 cleanup()
                 import os
+
                 os._exit(1)
-        print()
+            print()
+        else:
+            print("\nNo camera mxid in config, skipping camera initialization.")
 
     print(f"\n{'=' * 70}")
     print(f"Calibration Pose Replay - {arm_name.upper()}")
@@ -325,9 +329,6 @@ def main():
     print(f"Transition duration: {args.transition_duration}s")
     print(f"Settle time: {args.settle_time}s")
     print(f"{'=' * 70}\n")
-
-    # Load robot config
-    cfg = OmegaConf.to_container(OmegaConf.load(args.config_path), resolve=True)
 
     # Create robot
     robot_cfg = cfg["robot"]
@@ -468,7 +469,9 @@ def main():
             # Capture image
             print("  Capturing image...", end="", flush=True)
             capture_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            success = capture_camera_image(cameras, output_dir, pose_num, capture_timestamp)
+            success = capture_camera_image(
+                cameras, output_dir, pose_num, capture_timestamp
+            )
             if success:
                 print(" Done!")
                 ring_bell()

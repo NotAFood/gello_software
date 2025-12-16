@@ -177,6 +177,18 @@ def print_pose_info(pose_number: int, joint_positions: np.ndarray):
     print(f"{'=' * 60}\n")
 
 
+def infer_arm_name_from_channel(channel: str) -> str:
+    """Infer arm name (left/right) from a CAN channel string."""
+    channel_lower = channel.lower()
+
+    if any(tag in channel_lower for tag in ["left", "_l", "-l", " l", "l_"]):
+        return "left"
+    if any(tag in channel_lower for tag in ["right", "_r", "-r", " r", "r_"]):
+        return "right"
+
+    return "arm"
+
+
 def main():
     # Register cleanup handlers
     atexit.register(cleanup)
@@ -191,13 +203,17 @@ def main():
     # Auto-detect arm name from config path if not provided
     arm_name = args.arm_name
     if arm_name is None:
-        config_filename = Path(args.config_path).stem
-        if "right" in config_filename.lower():
-            arm_name = "right"
-        elif "left" in config_filename.lower():
-            arm_name = "left"
+        channel = cfg.get("robot", {}).get("channel") if isinstance(cfg, dict) else None
+        if isinstance(channel, str):
+            arm_name = infer_arm_name_from_channel(channel)
         else:
-            arm_name = "arm"
+            config_filename = Path(args.config_path).stem
+            if "right" in config_filename.lower():
+                arm_name = "right"
+            elif "left" in config_filename.lower():
+                arm_name = "left"
+            else:
+                arm_name = "arm"
 
     print(f"\n{'=' * 60}")
     print(f"Calibration Pose Capture - {arm_name.upper()} ARM")
@@ -331,6 +347,9 @@ def main():
             print("\nNo poses captured. Exiting without saving.")
 
         cleanup()
+        import os
+
+        os._exit(0)
 
 
 if __name__ == "__main__":

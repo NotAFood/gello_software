@@ -6,6 +6,7 @@ Supports device selection by MxId for multi-camera setups.
 
 Based on DepthAI v3.x API which simplified device connections.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -28,11 +29,12 @@ class OakColorCamera:
     device_mxid: Optional[str] = None  # Specific device MxId; None = first available
 
     # Output configuration
-    output_size: Tuple[int, int] = (640, 400)  # (width, height)
+    output_size: Tuple[int, int] = (1280, 800)  # (width, height)
     fps: int = 30
 
     # Runtime state
     _device: Optional[Any] = field(default=None, init=False, repr=False)
+    _pipeline: Optional[Any] = field(default=None, init=False, repr=False)
     _queue: Optional[Any] = field(default=None, init=False, repr=False)
     _started: bool = field(default=False, init=False, repr=False)
 
@@ -45,10 +47,9 @@ class OakColorCamera:
 
     def _build_and_start(self):
         """Connect to device and start camera using v3.x API."""
-        # In v3, we connect to device with device info (like the get_oak_intrinsics example)
+        # In v3, we connect to device directly by MxId or first available
         if self.device_mxid:
-            device_info = dai.DeviceInfo(self.device_mxid)
-            self._device = dai.Device(device_info)
+            self._device = dai.Device(self.device_mxid)
         else:
             # Connect to first available device
             devices = dai.Device.getAllAvailableDevices()
@@ -56,35 +57,18 @@ class OakColorCamera:
                 raise RuntimeError("No OAK devices found")
             self._device = dai.Device(devices[0])
 
-        # In v3, we need to build a pipeline for camera streaming
-        # The pipeline creation happens after device connection
-        pipeline = dai.Pipeline()
-        
-        # Create ColorCamera node
-        cam_rgb = pipeline.create(dai.node.ColorCamera)
-        
-        # Find RGB socket (same approach as get_oak_intrinsics)
-        rgb_socket = (
-            dai.CameraBoardSocket.CAM_A
-            if hasattr(dai.CameraBoardSocket, "CAM_A")
-            else getattr(dai.CameraBoardSocket, "RGB", dai.CameraBoardSocket.AUTO)
-        )
-        cam_rgb.setBoardSocket(rgb_socket)
-        cam_rgb.setResolution(dai.ColorCameraProperties.SensorResolution.THE_1080_P)
-        cam_rgb.setFps(self.fps)
-        
-        # Set output size
-        w, h = int(self.output_size[0]), int(self.output_size[1])
-        cam_rgb.setPreviewSize(w, h)
-        cam_rgb.setInterleaved(False)
-        cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.RGB)
+        # Create pipeline with device context
+        self._pipeline = dai.Pipeline(self._device)
 
-            # In v3, we don't need XLinkOut - we create queues directly from outputs!
-            # Start pipeline on the device first
-        self._device.startPipeline(pipeline)
-        
-            # Create output queue directly from the camera output
-            self._queue = cam_rgb.preview.createOutputQueue(maxSize=4, blocking=False)
+        # Create camera node using simplified v3 API
+        cam = self._pipeline.create(dai.node.Camera).build()
+
+        # Request output with specific resolution
+        w, h = int(self.output_size[0]), int(self.output_size[1])
+        self._queue = cam.requestOutput((w, h)).createOutputQueue()
+
+        # Start pipeline
+        self._pipeline.start()
         self._started = True
 
     def read(self) -> Tuple[np.ndarray, float]:
@@ -98,18 +82,17 @@ class OakColorCamera:
         if not self._started or not self._queue:
             raise RuntimeError("Camera not started")
 
-        # Get latest frame (drain queue)
+        # Get latest frame from queue
         frame_data = self._queue.get()
-        while True:
-            latest = self._queue.tryGet()
-            if latest is None:
-                break
-            frame_data = latest
 
-        # Convert to numpy array (already RGB due to setColorOrder)
+        # Verify frame type and extract image
+        if not isinstance(frame_data, dai.ImgFrame):
+            raise RuntimeError(f"Unexpected frame type: {type(frame_data)}")
+
+        # Convert to numpy array (OpenCV format)
         frame_rgb = frame_data.getCvFrame()
 
-        # Get timestamp
+        # Get timestamp (in milliseconds)
         timestamp = frame_data.getTimestamp()
         timestamp_ms = timestamp.total_seconds() * 1000.0
 
@@ -124,10 +107,12 @@ class OakColorCamera:
     def stop(self) -> None:
         """Stop camera and release resources."""
         try:
-            if self._device is not None:
-                self._device.close()
+            if self._pipeline is not None:
+                # Pipeline cleanup is handled automatically in v3
+                pass
         finally:
             self._device = None
+            self._pipeline = None
             self._queue = None
             self._started = False
 
