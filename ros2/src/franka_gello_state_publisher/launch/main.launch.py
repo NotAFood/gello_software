@@ -1,7 +1,7 @@
 import os
 import yaml
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, OpaqueFunction
+from launch.actions import DeclareLaunchArgument, OpaqueFunction, Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
@@ -29,14 +29,20 @@ def generate_robot_nodes(context):
                 name="gello_publisher",
                 namespace=namespace,
                 output="screen",
+                on_exit=Shutdown(),
                 parameters=[
                     {"com_port": "/dev/serial/by-id/" + config["com_port"]},
                     {"gello_name": item_name},
-                    {"num_joints": config["num_joints"]},
+                    {"num_arm_joints": config["num_arm_joints"]},
                     {"joint_signs": config["joint_signs"]},
                     {"gripper": config["gripper"]},
                     {"gripper_range_rad": config["gripper_range_rad"]},
                     {"best_offsets": config["best_offsets"]},
+                    {"dynamixel_kp_p": config["dynamixel_kp_p"]},
+                    {"dynamixel_kp_i": config["dynamixel_kp_i"]},
+                    {"dynamixel_kp_d": config["dynamixel_kp_d"]},
+                    {"dynamixel_goal_position": config["dynamixel_goal_position"]},
+                    {"dynamixel_torque_enable": config["dynamixel_torque_enable"]},
                 ],
             )
         )
@@ -48,7 +54,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument(
                 "config_file",
-                default_value="example_fr3_config.yaml",
+                default_value="example_single.yaml",
                 description="Name of the gello configuration file to load",
             ),
             OpaqueFunction(function=generate_robot_nodes),
