@@ -7,9 +7,8 @@ import cv2
 import cv2.aruco as aruco
 import depthai as dai
 import numpy as np
-from omegaconf import OmegaConf
-
 from i2rt.robots.kinematics import Kinematics
+from omegaconf import OmegaConf
 
 # ChArUco board parameters (set to match your physical board)
 SQUARES_X = 14
@@ -25,7 +24,7 @@ YAM_SITE_NAME = "grasp_site"  # End-effector site for FK
 
 def _create_charuco_board() -> aruco.CharucoBoard:
     """Create a ChArUco board across OpenCV API variants.
-    
+
     Note: Board dimensions are in meters to match FK output units.
     """
 
@@ -136,7 +135,7 @@ def get_camera_intrinsics(
 
 def load_calibration_poses(poses_path: Path) -> dict:
     """Load calibration poses from JSON file.
-    
+
     Returns:
         Dictionary with 'arm_name', 'num_poses', and 'poses' (list of pose dicts).
         Each pose has 'pose_number', 'timestamp', and 'joint_positions' (np.ndarray).
@@ -163,7 +162,7 @@ def estimate_charuco_pose(
     image_path: Path, K: np.ndarray, dist_coeffs: np.ndarray, board
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Detect ChArUco board and estimate its pose in camera frame.
-    
+
     Returns:
         Tuple of (R_cam_board, t_cam_board) or None if detection failed.
         R_cam_board: 3×3 rotation matrix
@@ -299,7 +298,7 @@ def main():
     metadata = load_session_metadata(session_dir)
     config_path = Path(metadata["config_path"]).expanduser().resolve()
     poses_path = Path(metadata["poses_path"]).expanduser().resolve()
-    
+
     print(f"Robot config: {config_path}")
     print(f"Poses file: {poses_path}\n")
 
@@ -330,7 +329,7 @@ def main():
     xml_path = repo_root / YAM_XML_PATH
     if not xml_path.exists():
         raise FileNotFoundError(f"YAM XML not found at {xml_path}")
-    
+
     print(f"Initializing FK with: {xml_path}")
     print(f"End-effector site: {YAM_SITE_NAME}\n")
     kinematics = Kinematics(str(xml_path), YAM_SITE_NAME)
@@ -342,9 +341,9 @@ def main():
     # Collect hand-eye calibration pairs
     R_base_gripper_list = []  # Robot base → gripper transforms (from FK)
     t_base_gripper_list = []
-    R_cam_board_list = []     # Camera → board transforms (from detection)
+    R_cam_board_list = []  # Camera → board transforms (from detection)
     t_cam_board_list = []
-    
+
     print("=" * 80)
     print("Processing images...")
     print("=" * 80)
@@ -367,7 +366,7 @@ def main():
             continue
 
         print(f"\nPose #{pose_num}:")
-        
+
         # Compute FK: T_base_gripper
         # YAM MuJoCo model has 8 DOFs: 6 arm joints + 2 gripper fingers
         # We need all joint positions, but only the first 6 affect the end-effector pose
@@ -382,8 +381,8 @@ def main():
         else:
             # Fallback: pad with zeros if unexpected format
             joint_angles = np.zeros(8)
-            joint_angles[:len(joint_positions)] = joint_positions
-            
+            joint_angles[: len(joint_positions)] = joint_positions
+
         T_base_gripper = kinematics.fk(joint_angles)
         R_base_gripper = T_base_gripper[:3, :3]
         t_base_gripper = T_base_gripper[:3, 3]
@@ -407,9 +406,11 @@ def main():
         T_cam_board_full = np.eye(4)
         T_cam_board_full[:3, :3] = R_cam_board
         T_cam_board_full[:3, 3] = t_cam_board
-        
+
         # Note: We don't have T_gripper_cam yet, but we can show board in camera frame
-        print(f"  Board in camera frame: [{t_cam_board[0]:.3f}, {t_cam_board[1]:.3f}, {t_cam_board[2]:.3f}] m")
+        print(
+            f"  Board in camera frame: [{t_cam_board[0]:.3f}, {t_cam_board[1]:.3f}, {t_cam_board[2]:.3f}] m"
+        )
         print(f"  ✓ Added to calibration set ({len(R_base_gripper_list)} pairs total)")
 
     print(f"\n{'=' * 80}")
@@ -422,7 +423,7 @@ def main():
 
     # Run hand-eye calibration
     print("\nRunning cv2.calibrateHandEye (Tsai method)...\n")
-    
+
     R_gripper_cam, t_gripper_cam = cv2.calibrateHandEye(
         R_gripper2base=R_base_gripper_list,
         t_gripper2base=t_base_gripper_list,
@@ -448,35 +449,44 @@ def main():
     print("VERIFICATION: Board positions in base frame")
     print("=" * 80)
     print("(Should be consistent across all poses if calibration is accurate)\n")
-    
+
     board_positions_base = []
     for i, (R_base_grip, t_base_grip, R_cam_brd, t_cam_brd) in enumerate(
-        zip(R_base_gripper_list, t_base_gripper_list, R_cam_board_list, t_cam_board_list), 1
+        zip(
+            R_base_gripper_list, t_base_gripper_list, R_cam_board_list, t_cam_board_list
+        ),
+        1,
     ):
         # Build full transforms
         T_base_gripper = np.eye(4)
         T_base_gripper[:3, :3] = R_base_grip
         T_base_gripper[:3, 3] = t_base_grip.flatten()
-        
+
         T_cam_board = np.eye(4)
         T_cam_board[:3, :3] = R_cam_brd
         T_cam_board[:3, 3] = t_cam_brd.flatten()
-        
+
         # T_base_board = T_base_gripper @ T_gripper_cam @ T_cam_board
         T_base_board = T_base_gripper @ T_gripper_cam @ T_cam_board
-        
+
         board_pos = T_base_board[:3, 3]
         board_positions_base.append(board_pos)
-        print(f"  Pose #{i:2d}: [{board_pos[0]:7.4f}, {board_pos[1]:7.4f}, {board_pos[2]:7.4f}] m")
-    
+        print(
+            f"  Pose #{i:2d}: [{board_pos[0]:7.4f}, {board_pos[1]:7.4f}, {board_pos[2]:7.4f}] m"
+        )
+
     # Compute statistics
     board_positions_base = np.array(board_positions_base)
     mean_pos = np.mean(board_positions_base, axis=0)
     std_pos = np.std(board_positions_base, axis=0)
     max_deviation = np.max(np.linalg.norm(board_positions_base - mean_pos, axis=1))
-    
-    print(f"\n  Mean position: [{mean_pos[0]:7.4f}, {mean_pos[1]:7.4f}, {mean_pos[2]:7.4f}] m")
-    print(f"  Std deviation: [{std_pos[0]:7.4f}, {std_pos[1]:7.4f}, {std_pos[2]:7.4f}] m")
+
+    print(
+        f"\n  Mean position: [{mean_pos[0]:7.4f}, {mean_pos[1]:7.4f}, {mean_pos[2]:7.4f}] m"
+    )
+    print(
+        f"  Std deviation: [{std_pos[0]:7.4f}, {std_pos[1]:7.4f}, {std_pos[2]:7.4f}] m"
+    )
     print(f"  Max deviation from mean: {max_deviation:.4f} m")
     print(f"\n  (Lower values indicate better calibration quality)")
     print("=" * 80 + "\n")
