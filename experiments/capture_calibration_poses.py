@@ -132,13 +132,15 @@ class Args:
     """Optional name for the arm (e.g., 'left', 'right'). Auto-detected from config if not provided."""
 
 
-def save_calibration_poses(poses: list, output_path: Path, arm_name: str):
+def save_calibration_poses(
+    poses: list, output_path: Path, arm_identifier: str, filename_tag: str
+):
     """Save all captured poses to a JSON file."""
     output_path.mkdir(parents=True, exist_ok=True)
 
     # Create output filename with timestamp
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = output_path / f"calibration_poses_{arm_name}_{timestamp}.json"
+    filename = output_path / f"calibration_poses_{filename_tag}_{timestamp}.json"
 
     # Convert numpy arrays to lists for JSON serialization
     poses_serializable = []
@@ -154,7 +156,7 @@ def save_calibration_poses(poses: list, output_path: Path, arm_name: str):
     with open(filename, "w") as f:
         json.dump(
             {
-                "arm_name": arm_name,
+                "arm_name": arm_identifier,
                 "num_poses": len(poses),
                 "poses": poses_serializable,
             },
@@ -189,6 +191,21 @@ def infer_arm_name_from_channel(channel: str) -> str:
     return "arm"
 
 
+def resolve_config_identifier(config_path: str) -> tuple[str, str, Path]:
+    """Return the arm identifier (relative path) and a filename-safe slug."""
+    resolved = Path(config_path).expanduser().resolve()
+    repo_root = Path(__file__).resolve().parent.parent
+
+    try:
+        relative_path = resolved.relative_to(repo_root)
+    except ValueError:
+        relative_path = resolved
+
+    identifier = relative_path.as_posix()
+    slug = identifier.replace("\\", "/").replace("/", "__").replace(" ", "_")
+    return identifier, slug, resolved
+
+
 def main():
     # Register cleanup handlers
     atexit.register(cleanup)
@@ -197,28 +214,35 @@ def main():
 
     args = tyro.cli(Args)
 
-    # Load config
-    cfg = OmegaConf.to_container(OmegaConf.load(args.config_path), resolve=True)
+    arm_identifier, arm_slug, resolved_config_path = resolve_config_identifier(
+        args.config_path
+    )
 
-    # Auto-detect arm name from config path if not provided
-    arm_name = args.arm_name
-    if arm_name is None:
+    # Load config
+    cfg = OmegaConf.to_container(OmegaConf.load(resolved_config_path), resolve=True)
+
+    # Auto-detect arm side from config path if not provided
+    arm_side = args.arm_name
+    if arm_side is None:
         channel = cfg.get("robot", {}).get("channel") if isinstance(cfg, dict) else None
         if isinstance(channel, str):
-            arm_name = infer_arm_name_from_channel(channel)
+            arm_side = infer_arm_name_from_channel(channel)
         else:
             config_filename = Path(args.config_path).stem
             if "right" in config_filename.lower():
-                arm_name = "right"
+                arm_side = "right"
             elif "left" in config_filename.lower():
-                arm_name = "left"
+                arm_side = "left"
             else:
-                arm_name = "arm"
+                arm_side = "arm"
 
     print(f"\n{'=' * 60}")
-    print(f"Calibration Pose Capture - {arm_name.upper()} ARM")
+    print("Calibration Pose Capture")
+    print(f"Arm identifier: {arm_identifier}")
+    if arm_side:
+        print(f"Arm side (inferred): {arm_side}")
     print(f"{'=' * 60}")
-    print(f"Config: {args.config_path}")
+    print(f"Config: {resolved_config_path}")
     print(f"Output: {args.output_dir}")
     print(f"\nControls:")
     print(f"  b: Capture current pose")
@@ -342,7 +366,9 @@ def main():
 
         # Save all captured poses
         if captured_poses:
-            save_calibration_poses(captured_poses, args.output_dir, arm_name)
+            save_calibration_poses(
+                captured_poses, args.output_dir, arm_identifier, arm_slug
+            )
         else:
             print("\nNo poses captured. Exiting without saving.")
 
