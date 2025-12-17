@@ -9,13 +9,15 @@ Usage:
     # Right arm only
     uv run experiments/capture_calibration_poses.py --config-path configs/yam_auto_generated_right.yaml
 
+    # With overhead camera
+    uv run experiments/capture_calibration_poses.py --config-path configs/yam_auto_generated.yaml --overhead
+
 Controls:
     SPACE/ENTER: Capture current pose
     Q: Quit and save all poses
 """
 
 import atexit
-import json
 import signal
 import sys
 import termios
@@ -25,18 +27,25 @@ import tty
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import tyro
 import zmq.error
 from omegaconf import OmegaConf
 
+from gello.utils.calibration_utils import (
+    capture_camera_image,
+    ring_bell,
+    save_calibration_poses,
+    write_session_metadata,
+)
 from gello.utils.launch_utils import instantiate_from_dict, move_to_start_position
 
 # Global variables for cleanup
 active_threads = []
 active_servers = []
+active_cameras = []
 cleanup_in_progress = False
 
 
@@ -48,6 +57,14 @@ def cleanup():
     cleanup_in_progress = True
 
     print("\nCleaning up resources...")
+
+    # Stop cameras
+    for camera in active_cameras:
+        try:
+            camera.stop()
+        except Exception as e:
+            print(f"Error stopping camera: {e}")
+
     for server in active_servers:
         try:
             if hasattr(server, "close"):
@@ -128,44 +145,11 @@ class Args:
     output_dir: Path = Path("data/calibration_poses")
     """Directory to save calibration poses."""
 
+    overhead: bool = False
+    """Enable overhead camera data collection to data/calibration_overhead."""
+
     arm_name: Optional[str] = None
     """Optional name for the arm (e.g., 'left', 'right'). Auto-detected from config if not provided."""
-
-
-def save_calibration_poses(
-    poses: list, output_path: Path, arm_identifier: str, filename_tag: str
-):
-    """Save all captured poses to a JSON file."""
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    # Create output filename with timestamp
-    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    filename = output_path / f"calibration_poses_{filename_tag}_{timestamp}.json"
-
-    # Convert numpy arrays to lists for JSON serialization
-    poses_serializable = []
-    for pose in poses:
-        pose_data = {
-            "pose_number": pose["pose_number"],
-            "timestamp": pose["timestamp"],
-            "joint_positions": pose["joint_positions"].tolist(),
-        }
-        poses_serializable.append(pose_data)
-
-    # Save to JSON
-    with open(filename, "w") as f:
-        json.dump(
-            {
-                "arm_name": arm_identifier,
-                "num_poses": len(poses),
-                "poses": poses_serializable,
-            },
-            f,
-            indent=2,
-        )
-
-    print(f"\n✓ Saved {len(poses)} poses to {filename}")
-    return filename
 
 
 def print_pose_info(pose_number: int, joint_positions: np.ndarray):
@@ -204,6 +188,59 @@ def resolve_config_identifier(config_path: str) -> tuple[str, str, Path]:
     identifier = relative_path.as_posix()
     slug = identifier.replace("\\", "/").replace("/", "__").replace(" ", "_")
     return identifier, slug, resolved
+
+
+class OverheadCamera:
+    """RealSense overhead camera interface for calibration data collection."""
+
+    def __init__(self):
+        """Initialize RealSense pipeline for overhead camera."""
+        import pyrealsense2 as rs
+
+        self.name = "overhead"
+        self.pipeline = rs.pipeline()
+        self.config = rs.config()
+
+        # Enable the color stream
+        self.config.enable_stream(rs.stream.color)
+
+        print("    Initializing overhead RealSense camera...")
+        try:
+            self.pipeline.start(self.config)
+            print("    ✓ RealSense pipeline started")
+        except Exception as e:
+            print(f"    ✗ Failed to start RealSense pipeline: {e}")
+            raise
+
+    def read(self):
+        """Read frame from RealSense overhead camera.
+
+        Returns:
+            Tuple of (rgb_image, timestamp) where rgb_image is RGB in numpy array format
+        """
+        import cv2
+
+        frames = self.pipeline.wait_for_frames()
+        color_frame = frames.get_color_frame()
+
+        if not color_frame:
+            raise RuntimeError("Failed to get color frame from RealSense camera")
+
+        # Convert to numpy array (BGR format from RealSense)
+        bgr_image = np.asanyarray(color_frame.get_data())
+        # Convert BGR to RGB for consistent format
+        rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+
+        timestamp = datetime.now().isoformat()
+        return rgb_image, timestamp
+
+    def stop(self):
+        """Stop the camera and cleanup resources."""
+        try:
+            self.pipeline.stop()
+            print("    RealSense pipeline stopped")
+        except Exception as e:
+            print(f"Error stopping RealSense pipeline: {e}")
 
 
 def main():
@@ -245,8 +282,10 @@ def main():
     print(f"Config: {resolved_config_path}")
     print(f"Output: {args.output_dir}")
     print(f"\nControls:")
-    print(f"  b: Capture current pose")
-    print(f"  Q: Quit and save all poses")
+    print("  b: Capture current pose")
+    print("  Q: Quit and save all poses")
+    if args.overhead:
+        print("  [Overhead camera enabled]")
     print(f"{'=' * 60}\n")
 
     # Create agent
@@ -311,8 +350,31 @@ def main():
     print(f"\n✓ Robot initialized: {robot.__class__.__name__}")
     print(f"✓ Agent initialized: {agent.__class__.__name__}")
     print(f"✓ Control loop: {cfg.get('hz', 30)} Hz")
+
+    # Initialize overhead camera if requested
+    overhead_cameras: Dict = {}
+    overhead_output_dir: Optional[Path] = None
+    if args.overhead:
+        print("\nInitializing overhead camera...")
+        try:
+            overhead_camera = OverheadCamera()
+            overhead_cameras["overhead"] = overhead_camera
+            active_cameras.append(overhead_camera)
+            print("  ✓ Overhead camera ready")
+
+            # Setup output directory for overhead images
+            timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            overhead_output_dir = Path(
+                f"data/calibration_overhead/{arm_slug}_{timestamp}"
+            )
+            overhead_output_dir.mkdir(parents=True, exist_ok=True)
+            print(f"  Output directory: {overhead_output_dir}")
+        except Exception as e:
+            print(f"  ✗ Failed to initialize overhead camera: {e}")
+            overhead_cameras = {}
+
     print(
-        f"\nReady to capture poses! Move the robot and press SPACE/ENTER to capture.\n"
+        "\nReady to capture poses! Move the robot and press SPACE/ENTER to capture.\n"
     )
 
     # Initialize keyboard handler
@@ -350,11 +412,27 @@ def main():
                     captured_poses.append(captured_pose)
 
                     print_pose_info(pose_count, joint_positions)
+
+                    # Capture overhead image if enabled
+                    if args.overhead and overhead_output_dir:
+                        print("  Capturing overhead image...", end="", flush=True)
+                        capture_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        success = capture_camera_image(
+                            overhead_cameras,
+                            overhead_output_dir,
+                            pose_count,
+                            capture_timestamp,
+                        )
+                        if success:
+                            print(" Done!")
+                        else:
+                            print(" Failed!")
+
                     print(
                         f"Total poses captured: {pose_count} | Press SPACE/ENTER for more, Q to quit\n"
                     )
                     # Play the terminal bell as feedback
-                    print("\a", end="", flush=True)
+                    ring_bell()
 
             # Step the environment
             obs = env.step(action)
@@ -371,6 +449,21 @@ def main():
             )
         else:
             print("\nNo poses captured. Exiting without saving.")
+
+        # Write session metadata for overhead capture
+        if args.overhead and overhead_output_dir and captured_poses:
+            try:
+                write_session_metadata(
+                    output_dir=overhead_output_dir,
+                    config_path=resolved_config_path,
+                    poses_path=None,
+                    arm_identifier=arm_identifier,
+                    pose_numbers_replayed=list(range(1, len(captured_poses) + 1)),
+                    start_pose_index=0,
+                    total_poses=len(captured_poses),
+                )
+            except Exception as e:
+                print(f"Failed to write session metadata: {e}")
 
         cleanup()
         import os
