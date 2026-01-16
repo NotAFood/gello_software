@@ -4,13 +4,13 @@ Capture discrete robot poses for camera calibration.
 
 Usage:
     # Left arm only
-    uv run experiments/capture_calibration_poses.py --config-path configs/yam_auto_generated.yaml
+    uv run experiments/capture_calibration_poses.py --config-path configs/yam_left.yaml
 
     # Right arm only
-    uv run experiments/capture_calibration_poses.py --config-path configs/yam_auto_generated_right.yaml
+    uv run experiments/capture_calibration_poses.py --config-path configs/yam_right.yaml
 
     # With overhead camera
-    uv run experiments/capture_calibration_poses.py --config-path configs/yam_auto_generated.yaml --overhead
+    uv run experiments/capture_calibration_poses.py --config-path configs/yam_left.yaml --overhead
 
 Controls:
     SPACE/ENTER: Capture current pose
@@ -18,6 +18,7 @@ Controls:
 """
 
 import atexit
+import datetime
 import signal
 import sys
 import termios
@@ -25,7 +26,7 @@ import threading
 import time
 import tty
 from dataclasses import dataclass
-from datetime import datetime
+import datetime
 from pathlib import Path
 from typing import Dict, Optional
 

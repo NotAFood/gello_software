@@ -22,10 +22,12 @@ This script will:
 """
 
 import atexit
+import datetime
 import signal
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
