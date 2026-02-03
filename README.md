@@ -4,7 +4,7 @@
   <img src="imgs/title.png" />
 </p>
 
-GELLO is a general, low-cost, and intuitive teleoperation framework for robot manipulators. This repository contains all the software components for GELLO. 
+GELLO is a general, low-cost, and intuitive teleoperation framework for robot manipulators. This repository contains all the software components for GELLO.
 
 For additional resources:
 - [Project Website](https://wuphilipp.github.io/gello_site/)
@@ -286,6 +286,12 @@ Process collected data:
 python gello/data_utils/demo_to_gdict.py --source-dir=<source_dir>
 ```
 
+Calibration data format (overhead camera)
+--------------------------------------
+
+Overhead calibration sessions are saved as a single HDF5 file in `data/calibration_overhead/` named `{arm_slug}_{TIMESTAMP}/{arm_slug}_{TIMESTAMP}.h5`. Each file contains `/cameras/<name>/images` (RGB uint8, gzip compression), `/timestamps` (float64 epoch seconds), `/joint_angles` (float32 per-pose joint vector), and `/pose_index` (int32). Session-level metadata (e.g., `config_path`, `arm_identifier`, `created_at`, `total_poses`) is stored as HDF5 root attributes.
+
+
 ### Bimanual Operation
 
 The recommended way to use bimanual mode is with `launch_yaml.py`. Pass a config file for the right arm to `--right-config-path`.
@@ -302,9 +308,9 @@ python experiments/run_env.py --agent=gello --bimanual
 ### FACTR Gravity Compensation
 If you want to activate gravity compensation, all the code can be found in `gello/factr`. It works similarly to the regular launch but for now it's self-contained inside its own subdirectory and supports the YAM arm in sim and in hardware.
 
-The YAML provides important fields that can control the strength of the gravity compensation and friction. Feel free to mess around with the strenght and friction til you attain your desired 
+The YAML provides important fields that can control the strength of the gravity compensation and friction. Feel free to mess around with the strenght and friction til you attain your desired
 
-One important step is to add the URDF. We have provided the URDF for the active GELLO in the [Hardware Repository](https://github.com/wuphilipp/gello_mechanical). You will need to update the path in the YAML to the entry point of the URDF. 
+One important step is to add the URDF. We have provided the URDF for the active GELLO in the [Hardware Repository](https://github.com/wuphilipp/gello_mechanical). You will need to update the path in the YAML to the entry point of the URDF.
 ```bash
 python gello/factr/gravity_compensation.py --config configs/yam_gello_factr_hw.yaml
 

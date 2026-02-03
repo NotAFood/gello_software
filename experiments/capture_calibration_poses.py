@@ -18,7 +18,6 @@ Controls:
 """
 
 import atexit
-import datetime
 import signal
 import sys
 import termios
@@ -26,7 +25,7 @@ import threading
 import time
 import tty
 from dataclasses import dataclass
-import datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -36,10 +35,10 @@ import zmq.error
 from omegaconf import OmegaConf
 
 from gello.utils.calibration_utils import (
-    capture_camera_image,
+    append_frame_to_hdf5,
+    finalize_hdf5_metadata,
     ring_bell,
     save_calibration_poses,
-    write_session_metadata,
 )
 from gello.utils.launch_utils import instantiate_from_dict, move_to_start_position
 
@@ -203,7 +202,7 @@ class OverheadCamera:
         self.config = rs.config()
 
         # Enable the color stream
-        self.config.enable_stream(rs.stream.color)
+        self.config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
 
         print("    Initializing overhead RealSense camera...")
         try:
@@ -355,6 +354,7 @@ def main():
     # Initialize overhead camera if requested
     overhead_cameras: Dict = {}
     overhead_output_dir: Optional[Path] = None
+    overhead_h5_path: Optional[Path] = None
     if args.overhead:
         print("\nInitializing overhead camera...")
         try:
@@ -369,7 +369,10 @@ def main():
                 f"data/calibration_overhead/{arm_slug}_{timestamp}"
             )
             overhead_output_dir.mkdir(parents=True, exist_ok=True)
+            # HDF5 session file inside the session directory
+            overhead_h5_path = overhead_output_dir / f"{arm_slug}_{timestamp}.h5"
             print(f"  Output directory: {overhead_output_dir}")
+            print(f"  HDF5 session file: {overhead_h5_path}")
         except Exception as e:
             print(f"  ✗ Failed to initialize overhead camera: {e}")
             overhead_cameras = {}
@@ -414,20 +417,34 @@ def main():
 
                     print_pose_info(pose_count, joint_positions)
 
-                    # Capture overhead image if enabled
-                    if args.overhead and overhead_output_dir:
+                    # Capture overhead image if enabled (save to HDF5)
+                    if (
+                        args.overhead
+                        and overhead_output_dir
+                        and overhead_h5_path is not None
+                    ):
                         print("  Capturing overhead image...", end="", flush=True)
-                        capture_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                        success = capture_camera_image(
-                            overhead_cameras,
-                            overhead_output_dir,
-                            pose_count,
-                            capture_timestamp,
-                        )
-                        if success:
+                        # Read frames from all overhead cameras
+                        camera_images = {}
+                        for cam_name, cam in overhead_cameras.items():
+                            try:
+                                rgb_image, img_timestamp = cam.read()
+                                camera_images[cam_name] = rgb_image
+                            except Exception as e:
+                                print(f"    Error reading from {cam_name}: {e}")
+
+                        # Append to HDF5 session (timestamp as epoch seconds)
+                        try:
+                            append_frame_to_hdf5(
+                                overhead_h5_path,
+                                camera_images,
+                                time.time(),
+                                joint_positions,
+                                pose_count,
+                            )
                             print(" Done!")
-                        else:
-                            print(" Failed!")
+                        except Exception as e:
+                            print(f" Failed! {e}")
 
                     print(
                         f"Total poses captured: {pose_count} | Press SPACE/ENTER for more, Q to quit\n"
@@ -451,20 +468,15 @@ def main():
         else:
             print("\nNo poses captured. Exiting without saving.")
 
-        # Write session metadata for overhead capture
-        if args.overhead and overhead_output_dir and captured_poses:
+        # Finalize HDF5 metadata (store total_poses)
+        if args.overhead and overhead_h5_path is not None and captured_poses:
             try:
-                write_session_metadata(
-                    output_dir=overhead_output_dir,
-                    config_path=resolved_config_path,
-                    poses_path=None,
-                    arm_identifier=arm_identifier,
-                    pose_numbers_replayed=list(range(1, len(captured_poses) + 1)),
-                    start_pose_index=0,
-                    total_poses=len(captured_poses),
-                )
+                if overhead_h5_path.exists():
+                    finalize_hdf5_metadata(
+                        overhead_h5_path, {"total_poses": len(captured_poses)}
+                    )
             except Exception as e:
-                print(f"Failed to write session metadata: {e}")
+                print(f"Failed to finalize HDF5 metadata: {e}")
 
         cleanup()
         import os

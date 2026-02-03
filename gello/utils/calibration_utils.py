@@ -1,11 +1,13 @@
 """Shared utilities for camera calibration workflows."""
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional
 
 import cv2
+import h5py
 import numpy as np
 
 from gello.cameras.oak_camera import OakColorCamera
@@ -106,43 +108,9 @@ def capture_camera_image(
     pose_number: int,
     timestamp: str,
 ) -> bool:
-    """Capture images from all cameras and save to disk.
-
-    Args:
-        cameras: Dictionary mapping camera names to OakColorCamera instances
-        output_dir: Directory to save captured images
-        pose_number: Current pose number for filename
-        timestamp: Timestamp string for filename
-
-    Returns:
-        True if all captures succeeded, False otherwise
-    """
-    if not cameras:
-        print("    Warning: No cameras configured, skipping capture")
-        return True
-
-    success = True
-    for cam_name, camera in cameras.items():
-        try:
-            # Read frame from camera
-            rgb_image, img_timestamp = camera.read()
-
-            # Create filename: <camera_name>_pose_<num>_<timestamp>.png
-            filename = f"{cam_name}_pose_{pose_number:03d}_{timestamp}.png"
-            filepath = output_dir / filename
-
-            # Save image (using cv2 or PIL)
-            # Convert RGB to BGR for cv2
-            bgr_image = rgb_image[:, :, ::-1]
-            cv2.imwrite(str(filepath), bgr_image)
-
-            print(f"    Saved: {filename}")
-
-        except Exception as e:
-            print(f"    Error capturing from {cam_name}: {e}")
-            success = False
-
-    return success
+    raise RuntimeError(
+        "capture_camera_image (legacy PNG writer) has been removed; use HDF5 append functions instead"
+    )
 
 
 def load_calibration_poses(poses_path: Path) -> dict:
@@ -245,4 +213,199 @@ def write_session_metadata(
     with open(metadata_path, "w") as f:
         json.dump(metadata, f, indent=2)
 
-    print(f"Metadata written to {metadata_path}")
+    # Legacy JSON session metadata writing is deprecated for HDF5-only sessions.
+    # This function is intentionally left to allow callers to fail fast if still used.
+    raise RuntimeError(
+        "write_session_metadata has been removed: HDF5 sessions store metadata as root attributes"
+    )
+
+
+def init_overhead_hdf5_file(
+    h5_path: Path, image_shape: tuple, joint_dim: int, metadata: dict
+) -> None:
+    """Create and initialize an HDF5 session file for overhead calibration.
+
+    Args:
+        h5_path: Path to the HDF5 file to create.
+        image_shape: Tuple (H, W, C) describing image shape.
+        joint_dim: Number of joint values per pose.
+        metadata: Dict of root-level metadata to store as attributes.
+    """
+    h5_path.parent.mkdir(parents=True, exist_ok=True)
+    H, W, C = image_shape
+
+    with h5py.File(h5_path, "w") as f:
+        # Root attributes
+        for k, v in metadata.items():
+            try:
+                f.attrs[k] = v
+            except Exception:
+                f.attrs[k] = str(v)
+
+        # Create extendable root datasets for synchronized per-pose data
+        f.create_dataset(
+            "timestamps",
+            shape=(0,),
+            maxshape=(None,),
+            dtype="f8",
+            chunks=(1024,),
+            compression="gzip",
+            compression_opts=4,
+        )
+
+        f.create_dataset(
+            "joint_angles",
+            shape=(0, joint_dim),
+            maxshape=(None, joint_dim),
+            dtype="f4",
+            chunks=(1, joint_dim),
+            compression="gzip",
+            compression_opts=4,
+        )
+
+        f.create_dataset(
+            "pose_index",
+            shape=(0,),
+            maxshape=(None,),
+            dtype="i4",
+            chunks=(1024,),
+            compression="gzip",
+            compression_opts=4,
+        )
+
+
+def append_frame_to_hdf5(
+    h5_path: Path,
+    camera_images: Dict[str, np.ndarray],
+    timestamp: float,
+    joint_positions: np.ndarray,
+    pose_index: int,
+) -> None:
+    """Append one captured pose (images from one or more cameras) to the HDF5 session file.
+
+    Args:
+        h5_path: Path to HDF5 file (will be created if missing).
+        camera_images: Dict mapping camera name -> RGB numpy array (H,W,3) uint8
+        timestamp: Epoch seconds (float) timestamp for this capture
+        joint_positions: 1D numpy array of joint positions
+        pose_index: Integer pose index
+    """
+    # Validate camera_images
+    if not camera_images:
+        raise ValueError("camera_images must contain at least one camera image")
+
+    # Lazy init: create file and datasets if missing using first image shape
+    first_cam = next(iter(camera_images.items()))
+    _, first_img = first_cam
+    H, W, C = first_img.shape
+
+    joint_dim = int(joint_positions.shape[0])
+
+    if not h5_path.exists():
+        meta = {"created_at": datetime.now().isoformat(), "hdf5_version": 1}
+        init_overhead_hdf5_file(h5_path, (H, W, C), joint_dim, meta)
+
+    with h5py.File(h5_path, "a") as f:
+        # Ensure root datasets exist and have matching joint_dim
+        if "joint_angles" not in f:
+            init_overhead_hdf5_file(
+                h5_path,
+                (H, W, C),
+                joint_dim,
+                {"created_at": datetime.now().isoformat()},
+            )
+
+        # Resize root datasets by 1
+        n = f["timestamps"].shape[0]
+        f["timestamps"].resize((n + 1,))
+        f["joint_angles"].resize((n + 1, joint_dim))
+        f["pose_index"].resize((n + 1,))
+
+        # Write per-pose root data
+        f["timestamps"][n] = float(timestamp)
+        f["joint_angles"][n, :] = joint_positions.astype("f4")
+        f["pose_index"][n] = int(pose_index)
+
+        # For each camera, ensure dataset and append image
+        for cam_name, img in camera_images.items():
+            grp = f.require_group(f"cameras/{cam_name}")
+            if "images" not in grp:
+                grp.create_dataset(
+                    "images",
+                    shape=(0, H, W, C),
+                    maxshape=(None, H, W, C),
+                    dtype="u1",
+                    chunks=(1, H, W, C),
+                    compression="gzip",
+                    compression_opts=4,
+                )
+                grp["images"].attrs["encoding"] = "RGB"
+
+            img_ds = grp["images"]
+            img_ds.resize((img_ds.shape[0] + 1, H, W, C))
+            img_ds[img_ds.shape[0] - 1] = img.astype("u1")
+
+
+def finalize_hdf5_metadata(h5_path: Path, metadata_updates: dict) -> None:
+    """Update root attributes with final metadata (e.g., total_poses).
+
+    Args:
+        h5_path: Path to HDF5 file
+        metadata_updates: Dict of attributes to set/update
+    """
+    if not h5_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
+
+    with h5py.File(h5_path, "a") as f:
+        for k, v in metadata_updates.items():
+            try:
+                f.attrs[k] = v
+            except Exception:
+                f.attrs[k] = str(v)
+
+
+def load_session_from_hdf5(h5_path: Path) -> dict:
+    """Load an HDF5 calibration session and return structured data.
+
+    Returns a dict with keys:
+      - 'metadata': dict of root attributes
+      - 'timestamps': numpy array (N,)
+      - 'joint_angles': numpy array (N, J)
+      - 'pose_index': numpy array (N,)
+      - 'cameras': dict mapping camera name -> images array (N, H, W, C)
+    """
+    if not h5_path.exists():
+        raise FileNotFoundError(f"HDF5 file not found: {h5_path}")
+
+    out = {
+        "metadata": {},
+        "timestamps": None,
+        "joint_angles": None,
+        "pose_index": None,
+        "cameras": {},
+    }
+    with h5py.File(h5_path, "r") as f:
+        # Root attrs
+        for k, v in f.attrs.items():
+            try:
+                out["metadata"][k] = v
+            except Exception:
+                out["metadata"][k] = str(v)
+
+        # Root datasets
+        if "timestamps" in f:
+            out["timestamps"] = f["timestamps"][()]
+        if "joint_angles" in f:
+            out["joint_angles"] = f["joint_angles"][()]
+        if "pose_index" in f:
+            out["pose_index"] = f["pose_index"][()]
+
+        # Cameras
+        if "cameras" in f:
+            cam_grp = f["cameras"]
+            for cam_name in cam_grp:
+                grp = cam_grp[cam_name]
+                if "images" in grp:
+                    out["cameras"][cam_name] = grp["images"][()]
+
+    return out
