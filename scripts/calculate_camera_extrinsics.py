@@ -1,328 +1,214 @@
 import argparse
 import json
-import re
 from pathlib import Path
 
 import cv2
-import cv2.aruco as aruco
-import depthai as dai
+import h5py
 import numpy as np
 from i2rt.robots.kinematics import Kinematics
-from omegaconf import OmegaConf
 
-# ChArUco board parameters (set to match your physical board)
-SQUARES_X = 14
-SQUARES_Y = 9
-SQUARE_LENGTH_M = 0.020  # 20mm in meters
-MARKER_LENGTH_M = 0.015  # 15mm in meters
-ARUCO_DICT = aruco.getPredefinedDictionary(aruco.DICT_5X5_100)
+# Chessboard parameters (set to match your physical board)
+CHESSBOARD_ROWS = 4  # Number of internal corners along rows
+CHESSBOARD_COLS = 6  # Number of internal corners along columns
+CHECKER_SIZE_M = 0.03  # Size of each checker square in meters (30mm)
 
 # YAM robot XML path and FK site name
 YAM_XML_PATH = "third_party/mujoco_menagerie/i2rt_yam/yam.xml"
 YAM_SITE_NAME = "grasp_site"  # End-effector site for FK
 
 
-def _create_charuco_board() -> aruco.CharucoBoard:
-    """Create a ChArUco board across OpenCV API variants.
+def get_intrinsics_from_hdf5(h5_path: Path, cam_name: str = "overhead") -> tuple[np.ndarray, np.ndarray] | None:
+    """Load camera intrinsics from HDF5 file if stored.
 
-    Note: Board dimensions are in meters to match FK output units.
-    """
-
-    if hasattr(aruco, "CharucoBoard_create"):
-        return aruco.CharucoBoard_create(  # type: ignore[attr-defined]
-            SQUARES_X, SQUARES_Y, SQUARE_LENGTH_M, MARKER_LENGTH_M, ARUCO_DICT
-        )
-
-    if hasattr(aruco.CharucoBoard, "create"):
-        return aruco.CharucoBoard.create(  # type: ignore[attr-defined]
-            SQUARES_X, SQUARES_Y, SQUARE_LENGTH_M, MARKER_LENGTH_M, ARUCO_DICT
-        )
-
-    # Newer OpenCV exposes the constructor directly
-    try:
-        return aruco.CharucoBoard(
-            (SQUARES_X, SQUARES_Y), SQUARE_LENGTH_M, MARKER_LENGTH_M, ARUCO_DICT
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        raise AttributeError(
-            "cv2.aruco CharucoBoard factory not found in this OpenCV build"
-        ) from exc
-
-
-def _create_detector_parameters():
-    """Create detector parameters across OpenCV API variants."""
-
-    if hasattr(aruco, "DetectorParameters_create"):
-        return aruco.DetectorParameters_create()  # type: ignore[attr-defined]
-
-    if hasattr(aruco.DetectorParameters, "create"):
-        return aruco.DetectorParameters.create()  # type: ignore[attr-defined]
-
-    # Newer OpenCV exposes the constructor directly
-    try:
-        return aruco.DetectorParameters()
-    except Exception as exc:  # pragma: no cover - defensive
-        raise AttributeError(
-            "cv2.aruco DetectorParameters factory not found in this OpenCV build"
-        ) from exc
-
-
-def _detect_markers(gray: np.ndarray, aruco_params):
-    """Detect markers across OpenCV aruco API variants."""
-
-    if hasattr(aruco, "detectMarkers"):
-        return aruco.detectMarkers(gray, ARUCO_DICT, parameters=aruco_params)  # type: ignore[attr-defined]
-
-    if hasattr(aruco, "ArucoDetector"):
-        detector = aruco.ArucoDetector(ARUCO_DICT, aruco_params)  # type: ignore[attr-defined]
-        return detector.detectMarkers(gray)
-
-    raise AttributeError(
-        "cv2.aruco marker detection API not found in this OpenCV build"
-    )
-
-
-BOARD = _create_charuco_board()
-
-# Resolution used when reading intrinsics from the DepthAI device
-RGB_W = 1280
-RGB_H = 800
-
-
-def load_session_metadata(session_dir: Path) -> dict:
-    """Load session metadata.json from the session directory."""
-
-    metadata_path = session_dir / "session_metadata.json"
-    if not metadata_path.exists():
-        raise FileNotFoundError(f"Missing session_metadata.json in {session_dir}")
-
-    with open(metadata_path, "r") as f:
-        return json.load(f)
-
-
-def load_mxid_from_config(config_path: Path) -> str:
-    """Extract mxid from the robot config referenced in metadata."""
-
-    cfg = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
-    if not isinstance(cfg, dict):
-        raise ValueError("Robot config did not resolve to a dictionary.")
-
-    mxid = cfg.get("mxid")
-    if not mxid:
-        raise ValueError("mxid not found in robot config.")
-
-    return str(mxid)
-
-
-def get_camera_intrinsics(
-    mxid: str, width: int, height: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Read intrinsics and distortion coefficients from the DepthAI device."""
-
-    rgb_socket = (
-        dai.CameraBoardSocket.CAM_A
-        if hasattr(dai.CameraBoardSocket, "CAM_A")
-        else getattr(dai.CameraBoardSocket, "RGB", dai.CameraBoardSocket.AUTO)
-    )
-
-    with dai.Device(mxid) as device:
-        calib_data = device.readCalibration()
-        intrinsics = np.array(calib_data.getCameraIntrinsics(rgb_socket, width, height))
-        distortion = np.array(calib_data.getDistortionCoefficients(rgb_socket))
-
-    return intrinsics, distortion
-
-
-def load_calibration_poses(poses_path: Path) -> dict:
-    """Load calibration poses from JSON file.
+    Args:
+        h5_path: Path to HDF5 file
+        cam_name: Camera name to load intrinsics for (default: "overhead")
 
     Returns:
-        Dictionary with 'arm_name', 'num_poses', and 'poses' (list of pose dicts).
-        Each pose has 'pose_number', 'timestamp', and 'joint_positions' (np.ndarray).
+        Tuple of (camera_matrix, dist_coeffs) or None if not found
     """
-    with open(poses_path, "r") as f:
-        data = json.load(f)
+    try:
+        with h5py.File(h5_path, "r") as f:
+            # Try to load from root attributes first
+            fx_key = f"{cam_name}_intrinsics_fx"
+            if fx_key in f.attrs:
+                fx = float(f.attrs[fx_key])
+                fy = float(f.attrs[f"{cam_name}_intrinsics_fy"])
+                ppx = float(f.attrs[f"{cam_name}_intrinsics_ppx"])
+                ppy = float(f.attrs[f"{cam_name}_intrinsics_ppy"])
+                dist_str = f.attrs.get(f"{cam_name}_distortion_coeffs", "[]")
+                dist_coeffs = np.array(json.loads(dist_str), dtype=np.float32)
 
-    # Convert joint positions to numpy arrays
-    for pose in data["poses"]:
-        pose["joint_positions"] = np.array(pose["joint_positions"])
+                camera_matrix = np.array(
+                    [
+                        [fx, 0, ppx],
+                        [0, fy, ppy],
+                        [0, 0, 1],
+                    ],
+                    dtype=np.float32,
+                )
 
-    return data
+                print(
+                    f"Loaded {cam_name} intrinsics from HDF5: fx={fx:.2f}, fy={fy:.2f}, "
+                    f"ppx={ppx:.2f}, ppy={ppy:.2f}"
+                )
+                return camera_matrix, dist_coeffs
 
+            # Try to load from camera group attributes
+            cam_grp = f.get(f"cameras/{cam_name}")
+            if cam_grp and f"{cam_name}_fx" in cam_grp.attrs:
+                fx = float(cam_grp.attrs[f"{cam_name}_fx"])
+                fy = float(cam_grp.attrs[f"{cam_name}_fy"])
+                ppx = float(cam_grp.attrs[f"{cam_name}_ppx"])
+                ppy = float(cam_grp.attrs[f"{cam_name}_ppy"])
+                dist_str = cam_grp.attrs.get(f"{cam_name}_distortion_coeffs", "[]")
+                dist_coeffs = np.array(json.loads(dist_str), dtype=np.float32)
 
-def extract_pose_number_from_filename(image_path: Path) -> int | None:
-    """Extract pose number from image filename like 'wrist_*_pose_003_*.png'."""
-    match = re.search(r"pose_(\d+)", image_path.name)
-    if match:
-        return int(match.group(1))
+                camera_matrix = np.array(
+                    [
+                        [fx, 0, ppx],
+                        [0, fy, ppy],
+                        [0, 0, 1],
+                    ],
+                    dtype=np.float32,
+                )
+
+                print(
+                    f"Loaded {cam_name} intrinsics from HDF5 camera group: fx={fx:.2f}, fy={fy:.2f}, "
+                    f"ppx={ppx:.2f}, ppy={ppy:.2f}"
+                )
+                return camera_matrix, dist_coeffs
+
+    except Exception as e:
+        print(f"Failed to load intrinsics from HDF5: {e}")
+
     return None
 
 
-def estimate_charuco_pose(
-    image_path: Path, K: np.ndarray, dist_coeffs: np.ndarray, board
+def estimate_chessboard_pose(
+    img_rgb: np.ndarray, K: np.ndarray, dist_coeffs: np.ndarray, pattern: tuple, objp: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray] | None:
-    """Detect ChArUco board and estimate its pose in camera frame.
+    """Detect chessboard and estimate its pose in camera frame.
+
+    Args:
+        img_rgb: RGB image from H5 file
+        K: Camera intrinsics matrix
+        dist_coeffs: Distortion coefficients
+        pattern: Chessboard pattern (cols, rows)
+        objp: 3D object points for the chessboard
 
     Returns:
         Tuple of (R_cam_board, t_cam_board) or None if detection failed.
         R_cam_board: 3×3 rotation matrix
         t_cam_board: 3×1 translation vector in meters
     """
+    # Convert RGB to grayscale for detection
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
-    print(f"  Processing image: {image_path.name}")
+    # Find chessboard corners
+    found, corners = cv2.findChessboardCorners(gray, pattern, None)
 
-    if not image_path.exists():
-        print(f"    ERROR: Image file not found at {image_path}")
+    if not found:
+        print("    FAILED: Chessboard not detected.")
         return None
 
-    img = cv2.imread(str(image_path))
-    if img is None:
-        print("    ERROR: Could not read image.")
+    # Refine corner positions
+    criteria = (
+        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
+        30,
+        0.001,
+    )
+    corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), criteria)
+
+    # Estimate board pose using solvePnP
+    pose_ret, rvec, tvec = cv2.solvePnP(objp, corners, K, dist_coeffs)
+
+    if not pose_ret:
+        print("    FAILED: PnP could not solve the pose.")
         return None
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    aruco_params = _create_detector_parameters()
+    # Calculate RMS reprojection error
+    projected_points, _ = cv2.projectPoints(objp, rvec, tvec, K, dist_coeffs)
+    projected_points = projected_points.reshape(-1, 2)
+    errors = np.linalg.norm(corners.reshape(-1, 2) - projected_points, axis=1)
+    rms_error = np.sqrt(np.mean(errors**2))
 
-    if hasattr(aruco, "interpolateCornersCharuco") and hasattr(
-        aruco, "estimatePoseCharucoBoard"
-    ):
-        marker_corners, marker_ids, _ = _detect_markers(gray, aruco_params)
-        if marker_ids is None or len(marker_ids) == 0:
-            print("    FAILED: No ArUco markers detected.")
-            return None
+    R_cam_board = cv2.Rodrigues(rvec)[0]
+    t_cam_board = tvec.flatten()
 
-        _, charuco_corners, charuco_ids = aruco.interpolateCornersCharuco(  # type: ignore[attr-defined]
-            marker_corners,
-            marker_ids,
-            gray,
-            board,
-            cameraMatrix=K,
-            distCoeffs=dist_coeffs,
-        )
-
-        if charuco_ids is None or len(charuco_corners) < 4:
-            print("    FAILED: Too few ChArUco corners interpolated.")
-            return None
-
-        pose_ret, rvec_cam_board, tvec_cam_board = aruco.estimatePoseCharucoBoard(  # type: ignore[attr-defined]
-            charuco_corners, charuco_ids, board, K, dist_coeffs
-        )
-
-        if not pose_ret:
-            print("    FAILED: PnP could not solve the pose.")
-            return None
-
-    elif hasattr(aruco, "CharucoDetector"):
-        detector = aruco.CharucoDetector(  # type: ignore[attr-defined]
-            board, detectorParams=aruco_params
-        )
-        charuco_corners, charuco_ids, marker_corners, marker_ids = detector.detectBoard(
-            gray
-        )
-
-        if charuco_ids is None or len(charuco_corners) < 4:
-            print("    FAILED: Too few ChArUco corners detected.")
-            return None
-
-        # Build object/image points and solve PnP manually
-        obj_points = board.getChessboardCorners()[charuco_ids.flatten()]
-        img_points = charuco_corners.reshape(-1, 2)
-        success, rvec_cam_board, tvec_cam_board = cv2.solvePnP(
-            obj_points, img_points, K, dist_coeffs, flags=cv2.SOLVEPNP_ITERATIVE
-        )
-
-        if not success:
-            print("    FAILED: PnP could not solve the pose.")
-            return None
-
-    else:
-        raise AttributeError("cv2.aruco ChArUco pose estimation API not found")
-
-    R_cam_board = cv2.Rodrigues(rvec_cam_board)[0]
-    t_cam_board = tvec_cam_board.flatten()
-
-    print(f"    SUCCESS: Detected {len(charuco_ids)} corners")
+    print(f"    SUCCESS: Detected {len(corners)} corners, RMS error: {rms_error:.2f}px")
     return R_cam_board, t_cam_board
-
-
-def find_images(session_dir: Path, pattern: str) -> list[Path]:
-    """Return sorted list of images matching the pattern inside session_dir."""
-
-    images = sorted(session_dir.glob(pattern))
-    if not images:
-        raise FileNotFoundError(
-            f"No images found in {session_dir} matching pattern '{pattern}'."
-        )
-    return images
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Estimate camera extrinsics from a calibration session directory.",
+        description="Estimate camera extrinsics from an HDF5 calibration file.",
     )
     parser.add_argument(
-        "session_dir",
+        "h5_path",
         type=Path,
-        help="Calibration session directory with images and session_metadata.json.",
+        help="Path to the HDF5 calibration file containing images and joint angles.",
     )
     parser.add_argument(
-        "--image-glob",
-        default="*.png",
-        help="Glob pattern for calibration images inside the session directory.",
-    )
-    parser.add_argument(
-        "--rgb-width",
+        "--rows",
         type=int,
-        default=RGB_W,
-        help="RGB image width used when reading intrinsics from the device.",
+        default=CHESSBOARD_ROWS,
+        help="Number of chessboard rows (internal corners).",
     )
     parser.add_argument(
-        "--rgb-height",
+        "--cols",
         type=int,
-        default=RGB_H,
-        help="RGB image height used when reading intrinsics from the device.",
+        default=CHESSBOARD_COLS,
+        help="Number of chessboard columns (internal corners).",
+    )
+    parser.add_argument(
+        "--checker-size",
+        type=float,
+        default=CHECKER_SIZE_M,
+        help="Size of each checker square in meters.",
+    )
+    parser.add_argument(
+        "--camera",
+        type=str,
+        default="overhead",
+        help="Camera name to use from the H5 file (e.g., 'overhead', 'wrist').",
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    session_dir = args.session_dir
+    h5_path = args.h5_path
+
+    if not h5_path.exists():
+        print(f"ERROR: File not found: {h5_path}")
+        return
 
     print("\n" + "=" * 80)
     print("Hand-Eye Calibration using cv2.calibrateHandEye")
     print("=" * 80)
-    print(f"Session directory: {session_dir}\n")
+    print(f"HDF5 file: {h5_path}\n")
 
-    # Load session metadata
-    metadata = load_session_metadata(session_dir)
-    config_path = Path(metadata["config_path"]).expanduser().resolve()
-    poses_path = Path(metadata["poses_path"]).expanduser().resolve()
+    # Load camera intrinsics from H5 file
+    intrinsics = get_intrinsics_from_hdf5(h5_path, cam_name=args.camera)
+    if intrinsics is None:
+        print(f"ERROR: Could not load intrinsics for camera '{args.camera}' from H5 file.")
+        print("Make sure the H5 file contains intrinsics attributes.")
+        return
 
-    print(f"Robot config: {config_path}")
-    print(f"Poses file: {poses_path}\n")
-
-    # Load camera intrinsics
-    try:
-        mxid = load_mxid_from_config(config_path)
-        print(f"Camera mxid: {mxid}")
-    except Exception as exc:
-        raise RuntimeError(f"Failed to load mxid from {config_path}") from exc
-
-    try:
-        K, dist_coeffs = get_camera_intrinsics(mxid, args.rgb_width, args.rgb_height)
-    except Exception as exc:
-        raise RuntimeError(
-            "Unable to read camera intrinsics from DepthAI device."
-        ) from exc
-
+    K, dist_coeffs = intrinsics
     print(f"\nCamera intrinsics (K):\n{K}")
     print(f"Distortion coefficients: {dist_coeffs.flatten()}\n")
 
-    # Load calibration poses (joint angles)
-    poses_data = load_calibration_poses(poses_path)
-    poses = poses_data["poses"]
-    print(f"Loaded {len(poses)} calibration poses\n")
+    # Chessboard pattern setup
+    pattern = (args.cols, args.rows)
+    objp = np.zeros((args.rows * args.cols, 3), np.float32)
+    objp[:, :2] = np.mgrid[0 : args.cols, 0 : args.rows].T.reshape(-1, 2)
+    objp *= args.checker_size
+
+    print(f"Chessboard pattern: {args.cols}x{args.rows} (cols x rows)")
+    print(f"Checker size: {args.checker_size} m\n")
 
     # Initialize forward kinematics
     repo_root = Path(__file__).resolve().parent.parent
@@ -334,84 +220,102 @@ def main():
     print(f"End-effector site: {YAM_SITE_NAME}\n")
     kinematics = Kinematics(str(xml_path), YAM_SITE_NAME)
 
-    # Find all images
-    images = find_images(session_dir, args.image_glob)
-    print(f"Found {len(images)} image(s) matching '{args.image_glob}'\n")
-
-    # Collect hand-eye calibration pairs
-    R_base_gripper_list = []  # Robot base → gripper transforms (from FK)
-    t_base_gripper_list = []
-    R_cam_board_list = []  # Camera → board transforms (from detection)
-    t_cam_board_list = []
-
+    # Load data from H5 file
     print("=" * 80)
-    print("Processing images...")
+    print("Loading data from HDF5 file...")
     print("=" * 80)
 
-    for image_path in images:
-        pose_num = extract_pose_number_from_filename(image_path)
-        if pose_num is None:
-            print(f"⚠ Skipping {image_path.name}: cannot extract pose number")
-            continue
+    with h5py.File(h5_path, "r") as f:
+        # Check structure
+        if "cameras" not in f:
+            print("ERROR: No 'cameras' group found in HDF5.")
+            return
 
-        # Find matching pose
-        matching_pose = None
-        for pose in poses:
-            if pose["pose_number"] == pose_num:
-                matching_pose = pose
-                break
+        if args.camera not in f["cameras"]:
+            available = list(f["cameras"].keys())
+            print(f"ERROR: Camera '{args.camera}' not found in H5 file.")
+            print(f"Available cameras: {available}")
+            return
 
-        if matching_pose is None:
-            print(f"⚠ Skipping {image_path.name}: no matching pose #{pose_num}")
-            continue
+        # Load images
+        images = f[f"cameras/{args.camera}/images"][()]
+        print(f"Loaded {len(images)} images from camera '{args.camera}'")
 
-        print(f"\nPose #{pose_num}:")
+        # Load joint angles
+        if "joint_angles" not in f:
+            print("ERROR: No 'joint_angles' dataset found in HDF5.")
+            return
 
-        # Compute FK: T_base_gripper
-        # YAM MuJoCo model has 8 DOFs: 6 arm joints + 2 gripper fingers
-        # We need all joint positions, but only the first 6 affect the end-effector pose
-        joint_positions = matching_pose["joint_positions"]
-        if len(joint_positions) == 7:
-            # Format: [j1, j2, j3, j4, j5, j6, gripper]
-            # Convert to MuJoCo format: [j1, j2, j3, j4, j5, j6, left_finger, right_finger]
-            # The gripper value represents the left finger; right finger is negated (from equality constraint)
-            arm_joints = joint_positions[:6]
-            gripper_pos = joint_positions[6]
-            joint_angles = np.concatenate([arm_joints, [gripper_pos, -gripper_pos]])
-        else:
-            # Fallback: pad with zeros if unexpected format
-            joint_angles = np.zeros(8)
-            joint_angles[: len(joint_positions)] = joint_positions
+        joint_angles_data = f["joint_angles"][()]
+        print(f"Loaded {len(joint_angles_data)} joint angle sets\n")
 
-        T_base_gripper = kinematics.fk(joint_angles)
-        R_base_gripper = T_base_gripper[:3, :3]
-        t_base_gripper = T_base_gripper[:3, 3]
+        if len(images) != len(joint_angles_data):
+            print(
+                f"WARNING: Number of images ({len(images)}) doesn't match "
+                f"joint angles ({len(joint_angles_data)})"
+            )
 
-        # Detect ChArUco board: T_cam_board
-        detection_result = estimate_charuco_pose(image_path, K, dist_coeffs, BOARD)
-        if detection_result is None:
-            print(f"  ⚠ Skipping pose #{pose_num}: board detection failed")
-            continue
+        num_entries = min(len(images), len(joint_angles_data))
 
-        R_cam_board, t_cam_board = detection_result
+        # Collect hand-eye calibration pairs
+        R_base_gripper_list = []  # Robot base → gripper transforms (from FK)
+        t_base_gripper_list = []
+        R_cam_board_list = []  # Camera → board transforms (from detection)
+        t_cam_board_list = []
 
-        # Add to lists
-        R_base_gripper_list.append(R_base_gripper)
-        t_base_gripper_list.append(t_base_gripper.reshape(3, 1))
-        R_cam_board_list.append(R_cam_board)
-        t_cam_board_list.append(t_cam_board.reshape(3, 1))
+        print("=" * 80)
+        print("Processing images and computing hand-eye calibration pairs...")
+        print("=" * 80)
 
-        # Compute board position in base frame for verification
-        # T_base_board = T_base_gripper @ T_gripper_cam @ T_cam_board
-        T_cam_board_full = np.eye(4)
-        T_cam_board_full[:3, :3] = R_cam_board
-        T_cam_board_full[:3, 3] = t_cam_board
+        for idx in range(num_entries):
+            print(f"\nEntry {idx + 1}/{num_entries}:")
 
-        # Note: We don't have T_gripper_cam yet, but we can show board in camera frame
-        print(
-            f"  Board in camera frame: [{t_cam_board[0]:.3f}, {t_cam_board[1]:.3f}, {t_cam_board[2]:.3f}] m"
-        )
-        print(f"  ✓ Added to calibration set ({len(R_base_gripper_list)} pairs total)")
+            # Get image
+            img_rgb = images[idx]
+
+            # Get joint angles
+            joint_positions = joint_angles_data[idx]
+
+            # Compute FK: T_base_gripper
+            # YAM MuJoCo model has 8 DOFs: 6 arm joints + 2 gripper fingers
+            if len(joint_positions) == 7:
+                # Format: [j1, j2, j3, j4, j5, j6, gripper]
+                # Convert to MuJoCo format: [j1, j2, j3, j4, j5, j6, left_finger, right_finger]
+                arm_joints = joint_positions[:6]
+                gripper_pos = joint_positions[6]
+                joint_angles = np.concatenate([arm_joints, [gripper_pos, -gripper_pos]])
+            else:
+                # Assume full 8 DOF format or pad with zeros
+                joint_angles = np.zeros(8)
+                joint_angles[: len(joint_positions)] = joint_positions
+
+            T_base_gripper = kinematics.fk(joint_angles)
+            R_base_gripper = T_base_gripper[:3, :3]
+            t_base_gripper = T_base_gripper[:3, 3]
+
+            # Detect chessboard: T_cam_board
+            detection_result = estimate_chessboard_pose(img_rgb, K, dist_coeffs, pattern, objp)
+            if detection_result is None:
+                print(f"  ⚠ Skipping entry {idx + 1}: board detection failed")
+                continue
+
+            R_cam_board, t_cam_board = detection_result
+
+            # For eye-to-hand calibration (fixed camera, moving board),
+            # we need base→gripper transform (inverse of gripper→base from FK)
+            R_gripper_base = R_base_gripper.T  # Inverse of rotation
+            t_gripper_base = -R_gripper_base @ t_base_gripper  # Transform translation
+
+            # Add to lists
+            R_base_gripper_list.append(R_gripper_base)  # Actually base→gripper
+            t_base_gripper_list.append(t_gripper_base.reshape(3, 1))
+            R_cam_board_list.append(R_cam_board)
+            t_cam_board_list.append(t_cam_board.reshape(3, 1))
+
+            print(
+                f"  Board in camera frame: [{t_cam_board[0]:.3f}, {t_cam_board[1]:.3f}, {t_cam_board[2]:.3f}] m"
+            )
+            print(f"  ✓ Added to calibration set ({len(R_base_gripper_list)} pairs total)")
 
     print(f"\n{'=' * 80}")
     print(f"Collected {len(R_base_gripper_list)} valid calibration pairs")
@@ -421,11 +325,11 @@ def main():
         print("\n❌ ERROR: Need at least 3 valid pairs for hand-eye calibration")
         return
 
-    # Run hand-eye calibration
-    print("\nRunning cv2.calibrateHandEye (Tsai method)...\n")
+    # Run hand-eye calibration (eye-to-hand: fixed camera, moving board)
+    print("\nRunning cv2.calibrateHandEye (Tsai method) for eye-to-hand setup...\n")
 
-    R_gripper_cam, t_gripper_cam = cv2.calibrateHandEye(
-        R_gripper2base=R_base_gripper_list,
+    R_base_cam, t_base_cam = cv2.calibrateHandEye(
+        R_gripper2base=R_base_gripper_list,  # Actually base→gripper transforms
         t_gripper2base=t_base_gripper_list,
         R_target2cam=R_cam_board_list,
         t_target2cam=t_cam_board_list,
@@ -433,75 +337,140 @@ def main():
     )
 
     # Build full transform
-    T_gripper_cam = np.eye(4)
-    T_gripper_cam[:3, :3] = R_gripper_cam
-    T_gripper_cam[:3, 3] = t_gripper_cam.flatten()
+    T_base_cam = np.eye(4)
+    T_base_cam[:3, :3] = R_base_cam
+    T_base_cam[:3, 3] = t_base_cam.flatten()
 
     print("=" * 80)
-    print("CALIBRATION RESULT: T_gripper_cam (Camera in Gripper Frame)")
+    print("CALIBRATION RESULT: T_base_cam (Camera in Robot Base Frame)")
     print("=" * 80)
-    print(f"\n{T_gripper_cam}\n")
-    print(f"Translation (meters): {t_gripper_cam.flatten()}")
-    print(f"Rotation matrix:\n{R_gripper_cam}\n")
+    print(f"\n{T_base_cam}\n")
+    print(f"Translation (meters): {t_base_cam.flatten()}")
+    print(f"Rotation matrix:\n{R_base_cam}\n")
 
-    # Verify calibration quality by computing board positions
+    # Estimate T_gripper_board offset (board frame relative to gripper frame)
+    # Since the board is rigidly attached, we can estimate this offset
     print("=" * 80)
-    print("VERIFICATION: Board positions in base frame")
+    print("ESTIMATING T_gripper_board (Board offset from gripper)")
     print("=" * 80)
-    print("(Should be consistent across all poses if calibration is accurate)\n")
+    
+    # Invert T_base_cam to get T_cam_base
+    T_cam_base = np.linalg.inv(T_base_cam)
+    
+    # For each pose: T_cam_board_detected = T_cam_base @ T_base_gripper @ T_gripper_board
+    # Solve for T_gripper_board: T_gripper_board = T_base_gripper^-1 @ T_cam_base^-1 @ T_cam_board_detected
+    
+    T_gripper_board_list = []
+    for R_gripper_base, t_gripper_base, R_cam_brd, t_cam_brd in zip(
+        R_base_gripper_list, t_base_gripper_list, R_cam_board_list, t_cam_board_list
+    ):
+        # T_base_gripper (inverse of the stored gripper→base)
+        T_base_gripper = np.eye(4)
+        T_base_gripper[:3, :3] = R_gripper_base.T
+        T_base_gripper[:3, 3] = -R_gripper_base.T @ t_gripper_base.flatten()
+        
+        # T_cam_board detected
+        T_cam_board = np.eye(4)
+        T_cam_board[:3, :3] = R_cam_brd
+        T_cam_board[:3, 3] = t_cam_brd.flatten()
+        
+        # Solve: T_gripper_board = T_gripper_base @ T_base_cam @ T_cam_board
+        T_gripper_base = np.linalg.inv(T_base_gripper)
+        T_base_cam_inv = np.linalg.inv(T_cam_base)
+        T_gripper_board = T_gripper_base @ T_base_cam_inv @ T_cam_board
+        
+        T_gripper_board_list.append(T_gripper_board)
+    
+    # Average the transforms (simple approach: average translation and rotation separately)
+    translations = np.array([T[:3, 3] for T in T_gripper_board_list])
+    t_gripper_board_avg = np.mean(translations, axis=0)
+    
+    # For rotation, average using quaternions or matrix averaging (simple: just use median transform)
+    median_idx = len(T_gripper_board_list) // 2
+    R_gripper_board_avg = T_gripper_board_list[median_idx][:3, :3]
+    
+    T_gripper_board = np.eye(4)
+    T_gripper_board[:3, :3] = R_gripper_board_avg
+    T_gripper_board[:3, 3] = t_gripper_board_avg
+    
+    print(f"\nEstimated T_gripper_board (Board in Gripper Frame):")
+    print(f"{T_gripper_board}\n")
+    print(f"Translation offset: [{t_gripper_board_avg[0]:.4f}, {t_gripper_board_avg[1]:.4f}, {t_gripper_board_avg[2]:.4f}] m")
+    
+    # Check consistency of T_gripper_board estimates
+    translation_std = np.std(translations, axis=0)
+    print(f"Translation std dev: [{translation_std[0]:.4f}, {translation_std[1]:.4f}, {translation_std[2]:.4f}] m")
+    print(f"(Low std dev indicates board was rigidly attached)\n")
 
-    board_positions_base = []
-    for i, (R_base_grip, t_base_grip, R_cam_brd, t_cam_brd) in enumerate(
+    # Verify calibration quality by computing board positions in camera frame
+    print("=" * 80)
+    print("VERIFICATION: Board positions in camera frame (with T_gripper_board)")
+    print("=" * 80)
+    print("(Should match detected positions if calibration is accurate)\n")
+
+    board_positions_cam = []
+    board_positions_detected = []
+    for i, (R_gripper_base, t_gripper_base, R_cam_brd, t_cam_brd) in enumerate(
         zip(
             R_base_gripper_list, t_base_gripper_list, R_cam_board_list, t_cam_board_list
         ),
         1,
     ):
-        # Build full transforms
+        # Get T_base_gripper (inverse of the stored gripper→base)
         T_base_gripper = np.eye(4)
-        T_base_gripper[:3, :3] = R_base_grip
-        T_base_gripper[:3, 3] = t_base_grip.flatten()
+        T_base_gripper[:3, :3] = R_gripper_base.T
+        T_base_gripper[:3, 3] = -R_gripper_base.T @ t_gripper_base.flatten()
 
-        T_cam_board = np.eye(4)
-        T_cam_board[:3, :3] = R_cam_brd
-        T_cam_board[:3, 3] = t_cam_brd.flatten()
+        # T_cam_board_computed = T_cam_base @ T_base_gripper @ T_gripper_board
+        T_cam_board_computed = T_cam_base @ T_base_gripper @ T_gripper_board
 
-        # T_base_board = T_base_gripper @ T_gripper_cam @ T_cam_board
-        T_base_board = T_base_gripper @ T_gripper_cam @ T_cam_board
-
-        board_pos = T_base_board[:3, 3]
-        board_positions_base.append(board_pos)
+        board_pos_computed = T_cam_board_computed[:3, 3]
+        board_pos_detected = t_cam_brd.flatten()
+        
+        board_positions_cam.append(board_pos_computed)
+        board_positions_detected.append(board_pos_detected)
+        
+        error = np.linalg.norm(board_pos_computed - board_pos_detected)
         print(
-            f"  Pose #{i:2d}: [{board_pos[0]:7.4f}, {board_pos[1]:7.4f}, {board_pos[2]:7.4f}] m"
+            f"  Entry #{i:2d}: Computed [{board_pos_computed[0]:7.4f}, {board_pos_computed[1]:7.4f}, {board_pos_computed[2]:7.4f}] m "
+            f"| Detected [{board_pos_detected[0]:7.4f}, {board_pos_detected[1]:7.4f}, {board_pos_detected[2]:7.4f}] m "
+            f"| Error: {error:.4f} m"
         )
 
     # Compute statistics
-    board_positions_base = np.array(board_positions_base)
-    mean_pos = np.mean(board_positions_base, axis=0)
-    std_pos = np.std(board_positions_base, axis=0)
-    max_deviation = np.max(np.linalg.norm(board_positions_base - mean_pos, axis=1))
+    board_positions_cam = np.array(board_positions_cam)
+    board_positions_detected = np.array(board_positions_detected)
+    errors = np.linalg.norm(board_positions_cam - board_positions_detected, axis=1)
+    mean_error = np.mean(errors)
+    max_error = np.max(errors)
+    rms_error = np.sqrt(np.mean(errors**2))
 
-    print(
-        f"\n  Mean position: [{mean_pos[0]:7.4f}, {mean_pos[1]:7.4f}, {mean_pos[2]:7.4f}] m"
-    )
-    print(
-        f"  Std deviation: [{std_pos[0]:7.4f}, {std_pos[1]:7.4f}, {std_pos[2]:7.4f}] m"
-    )
-    print(f"  Max deviation from mean: {max_deviation:.4f} m")
-    print(f"\n  (Lower values indicate better calibration quality)")
+    print(f"\n  Mean reprojection error: {mean_error:.4f} m ({mean_error*1000:.2f} mm)")
+    print(f"  RMS reprojection error: {rms_error:.4f} m ({rms_error*1000:.2f} mm)")
+    print(f"  Max reprojection error: {max_error:.4f} m ({max_error*1000:.2f} mm)")
+    print("\n  (Lower values indicate better calibration quality)")
     print("=" * 80 + "\n")
 
     # Save result
-    output_path = session_dir / "hand_eye_calibration.json"
+    output_path = h5_path.parent / f"{h5_path.stem}_hand_eye_calibration.json"
     result = {
-        "T_gripper_cam": T_gripper_cam.tolist(),
-        "R_gripper_cam": R_gripper_cam.tolist(),
-        "t_gripper_cam": t_gripper_cam.flatten().tolist(),
+        "T_base_cam": T_base_cam.tolist(),
+        "R_base_cam": R_base_cam.tolist(),
+        "t_base_cam": t_base_cam.flatten().tolist(),
+        "T_gripper_board": T_gripper_board.tolist(),
+        "t_gripper_board": t_gripper_board_avg.tolist(),
         "num_pairs": len(R_base_gripper_list),
         "method": "cv2.CALIB_HAND_EYE_TSAI",
-        "board_square_size_m": SQUARE_LENGTH_M,
-        "board_marker_size_m": MARKER_LENGTH_M,
-        "board_dimensions": [SQUARES_X, SQUARES_Y],
+        "calibration_type": "eye-to-hand",
+        "chessboard_rows": args.rows,
+        "chessboard_cols": args.cols,
+        "checker_size_m": args.checker_size,
+        "camera_name": args.camera,
+        "source_h5": str(h5_path),
+        "mean_reprojection_error_m": float(mean_error),
+        "rms_reprojection_error_m": float(rms_error),
+        "max_reprojection_error_m": float(max_error),
+        "gripper_board_translation_std_m": translation_std.tolist(),
     }
 
     with open(output_path, "w") as f:

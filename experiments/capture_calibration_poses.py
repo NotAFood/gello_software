@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Capture discrete robot poses for camera calibration.
 
@@ -18,6 +17,7 @@ Controls:
 """
 
 import atexit
+import json
 import signal
 import sys
 import termios
@@ -34,6 +34,11 @@ import tyro
 import zmq.error
 from omegaconf import OmegaConf
 
+try:
+    import pyrealsense2 as rs
+except ImportError:
+    rs = None
+
 from gello.utils.calibration_utils import (
     append_frame_to_hdf5,
     finalize_hdf5_metadata,
@@ -47,6 +52,63 @@ active_threads = []
 active_servers = []
 active_cameras = []
 cleanup_in_progress = False
+
+
+def get_realsense_intrinsics():
+    """Get camera intrinsics from default RealSense device.
+
+    Returns:
+        Tuple of (camera_matrix, dist_coeffs, intrinsics_dict) or None if failed.
+        intrinsics_dict contains: fx, fy, ppx, ppy, and distortion coefficients
+    """
+    if rs is None:
+        print("    pyrealsense2 not installed, skipping intrinsics capture")
+        return None
+
+    try:
+        pipeline = rs.pipeline()
+        config = rs.config()
+        config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+        profile = pipeline.start(config)
+
+        # Get the color stream's intrinsics
+        color_stream = profile.get_stream(rs.stream.color)
+        intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
+
+        # Stop the pipeline
+        pipeline.stop()
+
+        # Create camera matrix from RealSense intrinsics
+        camera_matrix = np.array(
+            [
+                [intrinsics.fx, 0, intrinsics.ppx],
+                [0, intrinsics.fy, intrinsics.ppy],
+                [0, 0, 1],
+            ],
+            dtype=np.float32,
+        )
+        dist_coeffs = np.array(intrinsics.coeffs, dtype=np.float32)
+
+        # Store individual parameters for clarity
+        intrinsics_dict = {
+            "fx": float(intrinsics.fx),
+            "fy": float(intrinsics.fy),
+            "ppx": float(intrinsics.ppx),
+            "ppy": float(intrinsics.ppy),
+            "distortion_coeffs": dist_coeffs.tolist(),
+            "camera_matrix": camera_matrix.tolist(),
+        }
+
+        print(
+            f"    Loaded RealSense intrinsics: fx={intrinsics.fx:.2f}, fy={intrinsics.fy:.2f}, "
+            f"ppx={intrinsics.ppx:.2f}, ppy={intrinsics.ppy:.2f}"
+        )
+
+        return camera_matrix, dist_coeffs, intrinsics_dict
+
+    except Exception as e:
+        print(f"    Failed to get RealSense intrinsics: {e}")
+        return None
 
 
 def cleanup():
@@ -208,9 +270,63 @@ class OverheadCamera:
         try:
             self.pipeline.start(self.config)
             print("    ✓ RealSense pipeline started")
+
+            # Capture intrinsics after pipeline starts
+            self.camera_matrix = None
+            self.dist_coeffs = None
+            self.intrinsics = None
+            self._capture_intrinsics()
+
         except Exception as e:
             print(f"    ✗ Failed to start RealSense pipeline: {e}")
             raise
+
+    def _capture_intrinsics(self):
+        """Capture camera intrinsics from the active pipeline."""
+        try:
+            # Get color stream profile from the running pipeline
+            color_stream = self.pipeline.get_active_profile().get_stream(
+                rs.stream.color
+            )
+            rs_intrinsics = color_stream.as_video_stream_profile().get_intrinsics()
+
+            # Create camera matrix
+            self.camera_matrix = np.array(
+                [
+                    [rs_intrinsics.fx, 0, rs_intrinsics.ppx],
+                    [0, rs_intrinsics.fy, rs_intrinsics.ppy],
+                    [0, 0, 1],
+                ],
+                dtype=np.float32,
+            )
+            self.dist_coeffs = np.array(rs_intrinsics.coeffs, dtype=np.float32)
+
+            # Store individual parameters
+            self.intrinsics = {
+                "fx": float(rs_intrinsics.fx),
+                "fy": float(rs_intrinsics.fy),
+                "ppx": float(rs_intrinsics.ppx),
+                "ppy": float(rs_intrinsics.ppy),
+                "distortion_coeffs": self.dist_coeffs.tolist(),
+                "camera_matrix": self.camera_matrix.tolist(),
+            }
+
+            print(
+                f"    Captured intrinsics: fx={rs_intrinsics.fx:.2f}, fy={rs_intrinsics.fy:.2f}, "
+                f"ppx={rs_intrinsics.ppx:.2f}, ppy={rs_intrinsics.ppy:.2f}"
+            )
+        except Exception as e:
+            print(f"    Warning: Could not capture intrinsics: {e}")
+            self.intrinsics = None
+
+    def get_intrinsics(self):
+        """Get captured camera intrinsics.
+
+        Returns:
+            Dict with keys: fx, fy, ppx, ppy, distortion_coeffs, camera_matrix
+            Returns None if intrinsics were not captured.
+        """
+        return self.intrinsics
 
     def read(self):
         """Read frame from RealSense overhead camera.
@@ -241,6 +357,64 @@ class OverheadCamera:
             print("    RealSense pipeline stopped")
         except Exception as e:
             print(f"Error stopping RealSense pipeline: {e}")
+
+
+def _display_overhead_feed(overhead_cameras: Dict, stop_event: threading.Event):
+    """Display overhead camera feed in a separate thread.
+
+    Args:
+        overhead_cameras: Dict of camera name -> camera objects
+        stop_event: Threading event to signal when to stop displaying
+    """
+    import cv2
+
+    try:
+        while not stop_event.is_set():
+            for cam_name, cam in overhead_cameras.items():
+                try:
+                    rgb_image, _ = cam.read()
+                    # Convert RGB to BGR for cv2.imshow
+                    bgr_image = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2BGR)
+                    cv2.imshow(f"{cam_name.capitalize()} Camera", bgr_image)
+
+                    # Exit preview on ESC key
+                    if cv2.waitKey(1) & 0xFF == 27:
+                        stop_event.set()
+                        break
+                except Exception as e:
+                    print(f"Error displaying {cam_name}: {e}")
+            time.sleep(0.03)  # ~30 FPS
+    finally:
+        cv2.destroyAllWindows()
+
+
+def _store_camera_intrinsics_in_hdf5(h5_path: Path, camera_intrinsics: Dict) -> None:
+    """Store camera intrinsics in camera group attributes (Option B).
+
+    Args:
+        h5_path: Path to HDF5 file
+        camera_intrinsics: Dict mapping camera name -> intrinsics dict
+    """
+    try:
+        import h5py
+
+        with h5py.File(h5_path, "a") as f:
+            for cam_name, intrinsics_data in camera_intrinsics.items():
+                cam_group = f.get(f"cameras/{cam_name}")
+                if cam_group:
+                    # Store individual parameters
+                    cam_group.attrs[f"{cam_name}_fx"] = intrinsics_data["fx"]
+                    cam_group.attrs[f"{cam_name}_fy"] = intrinsics_data["fy"]
+                    cam_group.attrs[f"{cam_name}_ppx"] = intrinsics_data["ppx"]
+                    cam_group.attrs[f"{cam_name}_ppy"] = intrinsics_data["ppy"]
+                    cam_group.attrs[f"{cam_name}_distortion_coeffs"] = json.dumps(
+                        intrinsics_data["distortion_coeffs"]
+                    )
+                    cam_group.attrs[f"{cam_name}_camera_matrix"] = json.dumps(
+                        intrinsics_data["camera_matrix"]
+                    )
+    except Exception as e:
+        print(f"Warning: Failed to store intrinsics in camera group: {e}")
 
 
 def main():
@@ -355,12 +529,20 @@ def main():
     overhead_cameras: Dict = {}
     overhead_output_dir: Optional[Path] = None
     overhead_h5_path: Optional[Path] = None
+    overhead_intrinsics: Dict = {}  # Store intrinsics for each camera
+    preview_stop_event: Optional[threading.Event] = None
+
     if args.overhead:
         print("\nInitializing overhead camera...")
         try:
             overhead_camera = OverheadCamera()
             overhead_cameras["overhead"] = overhead_camera
             active_cameras.append(overhead_camera)
+
+            # Capture intrinsics if available
+            if overhead_camera.intrinsics:
+                overhead_intrinsics["overhead"] = overhead_camera.intrinsics
+
             print("  ✓ Overhead camera ready")
 
             # Setup output directory for overhead images
@@ -373,13 +555,22 @@ def main():
             overhead_h5_path = overhead_output_dir / f"{arm_slug}_{timestamp}.h5"
             print(f"  Output directory: {overhead_output_dir}")
             print(f"  HDF5 session file: {overhead_h5_path}")
+
+            # Start preview thread
+            preview_stop_event = threading.Event()
+            preview_thread = threading.Thread(
+                target=_display_overhead_feed,
+                args=(overhead_cameras, preview_stop_event),
+                daemon=True,
+            )
+            preview_thread.start()
+            active_threads.append(preview_thread)
+            print("  ✓ Camera preview started (press ESC in camera window to stop)")
         except Exception as e:
             print(f"  ✗ Failed to initialize overhead camera: {e}")
             overhead_cameras = {}
 
-    print(
-        "\nReady to capture poses! Move the robot and press SPACE/ENTER to capture.\n"
-    )
+    print("\nReady to capture poses! Move the robot and press b to capture.\n")
 
     # Initialize keyboard handler
     key_handler = SingleKeyCapture()
@@ -468,13 +659,41 @@ def main():
         else:
             print("\nNo poses captured. Exiting without saving.")
 
-        # Finalize HDF5 metadata (store total_poses)
+        # Finalize HDF5 metadata (store total_poses and intrinsics)
         if args.overhead and overhead_h5_path is not None and captured_poses:
             try:
                 if overhead_h5_path.exists():
-                    finalize_hdf5_metadata(
-                        overhead_h5_path, {"total_poses": len(captured_poses)}
-                    )
+                    metadata_updates = {"total_poses": len(captured_poses)}
+
+                    # Add intrinsics to metadata if available
+                    if overhead_intrinsics:
+                        for cam_name, intrinsics_data in overhead_intrinsics.items():
+                            # Store individual parameters in root attributes
+                            metadata_updates[f"{cam_name}_intrinsics_fx"] = (
+                                intrinsics_data["fx"]
+                            )
+                            metadata_updates[f"{cam_name}_intrinsics_fy"] = (
+                                intrinsics_data["fy"]
+                            )
+                            metadata_updates[f"{cam_name}_intrinsics_ppx"] = (
+                                intrinsics_data["ppx"]
+                            )
+                            metadata_updates[f"{cam_name}_intrinsics_ppy"] = (
+                                intrinsics_data["ppy"]
+                            )
+                            metadata_updates[f"{cam_name}_distortion_coeffs"] = (
+                                json.dumps(intrinsics_data["distortion_coeffs"])
+                            )
+                            metadata_updates[f"{cam_name}_camera_matrix"] = json.dumps(
+                                intrinsics_data["camera_matrix"]
+                            )
+
+                        # Also store intrinsics in camera group attributes
+                        _store_camera_intrinsics_in_hdf5(
+                            overhead_h5_path, overhead_intrinsics
+                        )
+
+                    finalize_hdf5_metadata(overhead_h5_path, metadata_updates)
             except Exception as e:
                 print(f"Failed to finalize HDF5 metadata: {e}")
 
